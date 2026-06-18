@@ -28,7 +28,7 @@ import matplotlib.pyplot as plt
 PIX_SCALE       = 0.262       # arcsec/pixel for Legacy Surveys
 CUTOUT_SIZE_PIX = 152         # fixed 152x152 cutouts
 BANDS           = "grz"       # bands to request
-LAYER           = "ls-dr11"   # LS data release
+LAYER           = "ls-dr10"   # LS data release
 VIEWER_URL      = "https://www.legacysurvey.org/viewer/cutout.fits"
 
 TIMEOUT         = 15          # seconds per HTTP request
@@ -213,8 +213,7 @@ if __name__ == "__main__":
     ap.add_argument("--outdir", required=True, help="Output directory for FITS/PNGs")
     ap.add_argument("--bands", default=BANDS, help="Bands to request (e.g., grz)")
     ap.add_argument("--size", type=int, default=CUTOUT_SIZE_PIX, help="Cutout size (pixels per side)")
-    ap.add_argument("--layer", default=LAYER, help="Legacy Surveys layer (ls-dr9 or ls-dr10) [kept for completeness]") 
-    # ^^Does this need updating to include ls-dr11?
+    ap.add_argument("--layer", default=LAYER, help="Legacy Surveys layer") 
     ap.add_argument("--png-only", action="store_true", help="Do not download; build PNGs for existing FITS only")
     ap.add_argument("--timeout", type=int, default=TIMEOUT, help="Per-request timeout (s)")
     ap.add_argument("--retries", type=int, default=MAX_RETRIES, help="Max attempts per target")
