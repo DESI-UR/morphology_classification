@@ -15,8 +15,8 @@ conda activate desi
 export OMP_NUM_THREADS=1      # avoid thread oversubscription in libs
 export MPLBACKEND=Agg         # headless matplotlib
 
-CHUNK_DIR=/pscratch/sd/j/jlargett/DESI_SGA_MINE/Sorter/FP/chunks_missing_4
-OUT=/pscratch/sd/j/jlargett/DESI_SGA_MINE/Sorter/FP/fpy3_cutouts
+CHUNK_DIR=/pscratch/sd/q/qshimp/Sorter/chunks_missing_4
+OUT=/pscratch/sd/q/qshimp/Sorter/SGA_cutouts
 mkdir -p "$OUT" logs
 
 # Choose a polite level of parallelism for the remote server:
