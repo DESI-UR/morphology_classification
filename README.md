@@ -11,14 +11,20 @@ The first step in classifying galaxies' morphologies is creating/formatting a da
 The classifier runs on galaxy images with specific dimensions; your dataset must include these images, else you must generate them.
 #### Small Datasets
 You can use `make_cutouts.py` to generate a small batch of cutouts (I found it takes 10 minutes to generate 1000 cutouts) via the Legacy Survey Sky Browser. Make sure the LAYER is set to your desired data release. To run, follow these steps:
+
 `cd morphology_classification`
+
 `source /global/common/software/desi/desi_environment.sh main`
+
 `python make_cutouts.py --csv /file/path/to/targets.csv --outdir /folder/for/cutouts`
+
 Replace /file/path/to/targets.csv with your file path and replace /folder/for/cutouts with your folder to store cutouts.
 NOTE: For some reason that I haven't bothered troubleshooting, cutouts are generated vertically flipped.
 ##### Formatting FP_cutouts.py
 In your data formatting file (See /SGA/SGA_Cutouts.ipynb for an example), you should run a line that supplies the correct format to required columns:
+
 `yourData = yourData.rename(columns={"yourRA": "Target_RA", "yourDec": "Target_DEC", "yourID": "TargetID"})`
+
 The program uses IDs solely to name files, so datasets lacking IDs may assign arbitrary IDs to meet this requirement.
 
 #### Large Datasets
@@ -32,7 +38,9 @@ The path finder is configured to the current version of make_cutouts.py, you wil
 I'm considering turning it into a function so you merely need to input the directory, file name, and specify column names instead of adjusting the code yourself. Also when I get John's program I will make an option to specify whether it was generated with the web version or John's version. 
 
 You must add a main type column to your target dataset. Give it the value 30. Now append this file 
+
 `/pscratch/sd/q/qshimp/SGA2020-data/Anchors/VI_4000_sga152x152.fits`
+
 Now you can save this file.
 
 My code currently does this very clunkily going back and forth between SGA generator and SGA cutouts. I'm going to move it all to generator and make it a single function for less user input.

@@ -181,11 +181,15 @@ def main(targets_csv, outdir, bands=BANDS, size=CUTOUT_SIZE_PIX, layer=LAYER,
             if not os.path.exists(fits_out):
                 logging.warning("Missing FITS for targetid=%d; skipping PNG-only.", tid)
                 continue
-            try:
-                save_png_preview_cube_only(fits_out, png_out)
+            if not os.path.exists(png_out):
+                try:
+                    save_png_preview_cube_only(fits_out, png_out)
+                except Exception as e:
+                    logging.warning(
+                        "PNG preview failed for targetid=%d: %s",
+                        tid, str(e)
+                    )
                 logging.info("PNG regenerated for targetid=%d", tid)
-            except Exception as e:
-                logging.warning("PNG regen failed for targetid=%d: %s", tid, str(e))
             continue
 
         # Normal mode: fetch FITS if needed, then write PNG
