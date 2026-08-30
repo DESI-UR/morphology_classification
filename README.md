@@ -1,4 +1,4 @@
-# Ultimate Guide to Using the Morphology Classifier
+# Ultimate Guide to Using the Morphology Classifier (obsolete)
 ##### By Quillan Shimp
 
 ###### Note from Julia
@@ -28,7 +28,7 @@ In your data formatting file (See /SGA/SGA_Cutouts.ipynb for an example), you sh
 The program uses IDs solely to name files, so datasets lacking IDs may assign arbitrary IDs to meet this requirement.
 
 #### Large Datasets
-For larger datasets, use [non-existent John path\]
+For larger datasets, use their existing cutout catalog, such as SGA-2025
 
 ### Appending Cutout Paths and Anchors
 As of now, you should use /SGA/SGA_Generator.ipynb to append cutout paths to your target dataset. Currently, you must read your dataset, give the program the directory to your cutouts, plug in your specific names into the initializer, change the length to your length, and change the write location to a file of your choosing. 
@@ -45,8 +45,7 @@ Now you can save this file.
 
 My code currently does this very clunkily going back and forth between SGA generator and SGA cutouts. I'm going to move it all to generator and make it a single function for less user input.
 
-WARNING: If your ID system is not the same, you will need to check for duplicates and add a small id tag that can distinguish duplicates without creating more duplicates. I had just one duplicate pair between SGA id and SGA 2025 beta's ref id, and adding a 0 to the end of the ref id worked just fine.
-
+WARNING: If your ID system is not the same, this will not function.
 ### Creating the h5py File
 All formatting should be complete, and you should be able to simply change the input file that gal_dataset reads on /h5py-code/h5py-Generator.ipynb. 
 If you run into issues, try changing the formatting to match the h5py file. If your input dataset changes the path datatype, you will need to manually edit that in SGA generator before running the h5py generator. I haven't figured out how to retain the byte datatype properly in a CSV file yet. 
