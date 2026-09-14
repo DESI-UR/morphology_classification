@@ -4,6 +4,8 @@ CutoutVetter: interactive click-to-vet grid of galaxy cutouts.
 import os
 import csv
 import glob
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 
 import numpy as np
@@ -20,8 +22,8 @@ MASTER_LOG_FIELDNAMES = ["SGAID", "VI_REGION", "RA", "DEC", "morph_reviewed", "s
 
 class ReviewerLogin:
     def __init__(self, morph_options, data_lookup_fn, df, cutout_index, sdss_rgb_fn,
-                 load_jpg_fn=None, initial_morph=None, ncols=4, n_per_page=25,
-                 figsize_per=2, title_fontsize=None,
+                 load_jpg_fn=None, load_jpg_band_fn=None, initial_morph=None, ncols=4, n_per_page=25,
+                 figsize_per=2, title_fontsize=None, n_workers=8,
                  save_dir="/global/cfs/cdirs/desicollab/users/qshimp/anchors"):
         self.morph_options = morph_options
         self.data_lookup_fn = data_lookup_fn
@@ -29,15 +31,17 @@ class ReviewerLogin:
         self.cutout_index = cutout_index
         self.sdss_rgb_fn = sdss_rgb_fn
         self.load_jpg_fn = load_jpg_fn
+        self.load_jpg_band_fn = load_jpg_band_fn
         self.initial_morph = initial_morph
         self.ncols = ncols
         self.n_per_page = n_per_page
         self.figsize_per = figsize_per
         self.title_fontsize = title_fontsize
+        self.n_workers = n_workers
         self.save_dir = save_dir
 
         self.vetter = None
-        self.vetter_output = widgets.Output()   # pre-attached container for the vetter's later display() calls
+        self.vetter_output = widgets.Output()
 
         self.title = widgets.HTML("<h2>Galaxy Anchor Review</h2>")
         self.username_box = widgets.Text(
@@ -52,7 +56,6 @@ class ReviewerLogin:
         self.username_box.on_submit(self._on_username_submit)
 
         self.login_box = widgets.VBox([self.title, self.username_box, self.enter_btn, self.status])
-        # display BOTH containers now, synchronously, in the real cell-execution context
         display(widgets.VBox([self.login_box, self.vetter_output]))
 
     def _on_username_submit(self, _):
@@ -73,15 +76,22 @@ class ReviewerLogin:
             self.status.value = "<b>Invalid username.</b> Please avoid / \\ : * ? \" &lt; &gt; |"
             return
 
+        # Disable inputs immediately so repeated Enter presses can't queue
+        # up duplicate session builds while loading.
+        self.username_box.disabled = True
+        self.enter_btn.disabled = True
+        self.status.value = (
+            f"<i>⏳ Loading your review session for <b>{username}</b> — this can "
+            f"take a little while on a slow kernel. Please don't click again.</i>"
+        )
+
         review_dir = os.path.join(self.save_dir, "anchor_review", username)
         os.makedirs(review_dir, exist_ok=True)
 
         self.username = username
         self.review_dir = review_dir
-        self.status.value = f"<i>Starting review session for <b>{username}</b>...</i>"
-        self.login_box.layout.display = "none"
 
-        with self.vetter_output:   # captures CutoutVetter's internal display() call correctly
+        with self.vetter_output:
             self.vetter = CutoutVetter(
                 morph_options=self.morph_options,
                 data_lookup_fn=self.data_lookup_fn,
@@ -89,19 +99,28 @@ class ReviewerLogin:
                 cutout_index=self.cutout_index,
                 sdss_rgb_fn=self.sdss_rgb_fn,
                 load_jpg_fn=self.load_jpg_fn,
+                load_jpg_band_fn=self.load_jpg_band_fn,
                 initial_morph=self.initial_morph,
                 ncols=self.ncols,
                 n_per_page=self.n_per_page,
                 figsize_per=self.figsize_per,
                 title_fontsize=self.title_fontsize,
+                n_workers=self.n_workers,
                 save_dir=self.review_dir,
                 on_exit=self._on_vetter_exit,
             )
         self.vetter.username = self.username
 
+        # Only hide the login screen once the vetter is actually built and ready.
+        self.login_box.layout.display = "none"
+
     def _on_vetter_exit(self):
-        self.vetter_output.clear_output()   # tears down the vetter's display cleanly
+        if self.vetter is not None:
+            self.vetter.close()
+        self.vetter_output.clear_output()
         self.username_box.value = ""
+        self.username_box.disabled = False
+        self.enter_btn.disabled = False
         self.status.value = "<i>Enter your username to begin.</i>"
         self.login_box.layout.display = ""
 
@@ -110,20 +129,29 @@ class CutoutVetter:
     ALT_MORPHOLOGIES = ["Elliptical", "Lenticular", "Spiral", "Irregular"]
 
     def __init__(self, morph_options, data_lookup_fn, df, cutout_index, sdss_rgb_fn,
-                 load_jpg_fn=None, initial_morph=None, ncols=4, n_per_page=25, figsize_per=2,
-                 title_fontsize=None, save_dir="/pscratch/sd/q/qshimp/Sorter", on_exit=None):
+                 load_jpg_fn=None, load_jpg_band_fn=None, initial_morph=None, ncols=4, n_per_page=25, figsize_per=2,
+                 title_fontsize=None, n_workers=8,
+                 save_dir="/pscratch/sd/q/qshimp/Sorter", on_exit=None):
         self.data_lookup_fn = data_lookup_fn
         self.df = df
         self.cutout_index = cutout_index
         self.load_jpg_fn = load_jpg_fn
+        self.load_jpg_band_fn = load_jpg_band_fn
         self.sdss_rgb_fn = sdss_rgb_fn
         self.ncols = ncols
         self.n_per_page = n_per_page
         self.figsize_per = figsize_per
         self.title_fontsize = title_fontsize or max(6, int(figsize_per * 4))
+        self.n_workers = n_workers
         self.save_dir = save_dir
         self.on_exit = on_exit
         self.view_mode = "Image" if load_jpg_fn is not None else "SSL"
+
+        # image loading: cache + kept-open HDF5 handles + a lock around HDF5 reads
+        # (HDF5 isn't reliably safe for concurrent reads from multiple threads)
+        self._image_cache = {}          # (key, view_mode) -> rgb array or None
+        self._h5_handles = {}           # hdf5 filename -> open h5py.File
+        self._h5_lock = threading.Lock()
 
         self.morph_selector = widgets.Dropdown(
             options=morph_options,
@@ -137,6 +165,15 @@ class CutoutVetter:
         display(self.top_box)
 
         self._load_morphology(self.morph_selector.value, save_old=False)
+
+    def close(self):
+        """Close any open HDF5 handles. Call when the session is torn down."""
+        for H in self._h5_handles.values():
+            try:
+                H.close()
+            except Exception:
+                pass
+        self._h5_handles.clear()
 
     # ---------- morphology switching ----------
 
@@ -156,7 +193,6 @@ class CutoutVetter:
             self.save(morph_override=old_morph)
 
         data = self.data_lookup_fn(morph, self.df)
-        # composite key disambiguates SGAIDs that collide across regions
         self.gal_keys = [(int(r["SGAID"]), str(r["VI_REGION"])) for _, r in data.iterrows()]
         self.radec = {(int(r["SGAID"]), str(r["VI_REGION"])): (float(r["RA"]), float(r["DEC"]))
                       for _, r in data.iterrows()}
@@ -309,7 +345,7 @@ class CutoutVetter:
         marked = 0
         for key in page_keys:
             if self.border_color.get(key) is not None:
-                continue  # already reviewed or pending selection — leave alone
+                continue
             sgaid, region = key
             ra, dec = self.radec.get(key, (None, None))
             self.confirmed[key] = {
@@ -364,36 +400,90 @@ class CutoutVetter:
         self.page_jump.value = self.page + 1
         self._updating_page_jump = False
 
-    # ---------- figure / click handling ----------
+    # ---------- image loading (threaded, cached, with progress) ----------
 
-    def _get_display_image(self, key):
+    def _fetch_image_raw(self, key, view_mode):
+        """Pure fetch, no widget/matplotlib calls — safe to run in a worker thread."""
         sgaid, region = key
-        if self.view_mode == "SSL":
+        if view_mode == "SSL":
             cutout_key = (region, sgaid)
             if cutout_key not in self.cutout_index:
                 return None
             fname, idx = self.cutout_index[cutout_key]
-            with h5py.File(fname, "r") as H:
+            with self._h5_lock:   # HDF5 reads are serialized even though fetch scheduling is parallel
+                H = self._h5_handles.get(fname)
+                if H is None:
+                    H = h5py.File(fname, "r")
+                    self._h5_handles[fname] = H
                 img = H["images"][idx]
-            return self.sdss_rgb_fn([img[0], img[1], img[2]], ["g", "r", "z"])
+                return self.sdss_rgb_fn([img[0], img[1], img[2]], ["g", "r", "z"])
 
         row = self.rows_by_key.get(key)
         if row is None:
             return None
+    
+        if self.load_jpg_band_fn is not None:
+            try:
+                return self.load_jpg_band_fn(row, view_mode)   # fetch only the active band
+            except (KeyError, IndexError, FileNotFoundError):
+                return None
+    
+        # fallback: old 3-tuple API
         try:
             model, residual, image = self.load_jpg_fn(row)
         except (KeyError, IndexError, FileNotFoundError):
             return None
+        return {"Model": model, "Residual": residual, "Image": image}
 
-        if self.view_mode == "Model":
-            return model
-        elif self.view_mode == "Residual":
-            return residual
-        else:
-            return image
+    def _prefetch_page_images(self, page_keys):
+        """Concurrently fetch whatever isn't already cached for the current view_mode,
+        showing a live progress bar in plot_output while it works."""
+        to_fetch = [k for k in page_keys if (k, self.view_mode) not in self._image_cache]
+        if not to_fetch:
+            return
+
+        progress = widgets.IntProgress(
+            value=0, min=0, max=len(to_fetch), bar_style="info",
+            layout=widgets.Layout(width="400px"),
+        )
+        progress_label = widgets.HTML(value=f"Loading images: 0 / {len(to_fetch)} (0%)")
+        with self.plot_output:
+            self.plot_output.clear_output(wait=True)
+            display(widgets.VBox([progress_label, progress]))
+
+        with ThreadPoolExecutor(max_workers=self.n_workers) as executor:
+            futures = {executor.submit(self._fetch_image_raw, key, self.view_mode): key
+                      for key in to_fetch}
+            for i, future in enumerate(as_completed(futures), start=1):
+                key = futures[future]
+                try:
+                    result = future.result()
+                except Exception:
+                    result = None
+
+                if isinstance(result, dict):
+                    for band, arr in result.items():
+                        self._image_cache[(key, band)] = arr
+                else:
+                    self._image_cache[(key, self.view_mode)] = result
+
+                progress.value = i
+                pct = int(100 * i / len(to_fetch))
+                progress_label.value = f"Loading images: {i} / {len(to_fetch)} ({pct}%)"
+
+    def _get_cached_image(self, key):
+        return self._image_cache.get((key, self.view_mode))
+
+    # ---------- figure rendering ----------
 
     def _render_page(self):
         page_keys = self._page_keys()
+        self._prefetch_page_images(page_keys)
+
+        with self.plot_output:
+            self.plot_output.clear_output(wait=True)
+            display(widgets.HTML("<i>Rendering...</i>"))   # visible the instant fetching finishes
+
         ncols = self.ncols if self.ncols else 1
         nrows = int(np.ceil(len(page_keys) / ncols)) if page_keys else 1
         self.ncols = ncols
@@ -411,7 +501,7 @@ class CutoutVetter:
 
             for ax, key in zip(self.axes, page_keys):
                 sgaid, region = key
-                rgb = self._get_display_image(key)
+                rgb = self._get_cached_image(key)   # instant — already prefetched
                 if rgb is not None:
                     ax.imshow(rgb, origin="lower")
                 else:
@@ -433,6 +523,8 @@ class CutoutVetter:
 
             self.fig.tight_layout()
             self.fig.canvas.mpl_connect("button_press_event", self._on_click)
+            plt.show()
+            self.fig.canvas.draw()
             plt.show()
 
         self._update_page_label()
@@ -462,7 +554,7 @@ class CutoutVetter:
 
     def _on_view_mode_change(self, change):
         self.view_mode = change["new"]
-        self._render_page()
+        self._render_page()   # cheap/no-op prefetch if this mode's images are already cached
 
     def _mark_evaluated(self, key):
         self.state[key] = "reviewed"
@@ -582,12 +674,6 @@ class CutoutVetter:
 
 
 def confusion_matrix_report(save_dir, morph_options, username=None):
-    """
-    Original morphology (rows) x corrected morphology (columns) confusion
-    matrix, built from one user's review_log.csv or aggregated across every
-    reviewer's log if username is None. Bad-anchor calls get their own
-    column rather than a morphology cell.
-    """
     review_root = os.path.join(save_dir, "anchor_review")
     if username is not None:
         paths = [os.path.join(review_root, username, "review_log.csv")]
