@@ -76,8 +76,6 @@ class ReviewerLogin:
             self.status.value = "<b>Invalid username.</b> Please avoid / \\ : * ? \" &lt; &gt; |"
             return
 
-        # Disable inputs immediately so repeated Enter presses can't queue
-        # up duplicate session builds while loading.
         self.username_box.disabled = True
         self.enter_btn.disabled = True
         self.status.value = (
@@ -110,8 +108,6 @@ class ReviewerLogin:
                 on_exit=self._on_vetter_exit,
             )
         self.vetter.username = self.username
-
-        # Only hide the login screen once the vetter is actually built and ready.
         self.login_box.layout.display = "none"
 
     def _on_vetter_exit(self):
@@ -146,11 +142,10 @@ class CutoutVetter:
         self.save_dir = save_dir
         self.on_exit = on_exit
         self.view_mode = "Image" if load_jpg_fn is not None else "SSL"
+        self.filter_mode = "All"   # "All" or "Unmarked only" — persists across morphology switches
 
-        # image loading: cache + kept-open HDF5 handles + a lock around HDF5 reads
-        # (HDF5 isn't reliably safe for concurrent reads from multiple threads)
-        self._image_cache = {}          # (key, view_mode) -> rgb array or None
-        self._h5_handles = {}           # hdf5 filename -> open h5py.File
+        self._image_cache = {}
+        self._h5_handles = {}
         self._h5_lock = threading.Lock()
 
         self.morph_selector = widgets.Dropdown(
@@ -167,7 +162,6 @@ class CutoutVetter:
         self._load_morphology(self.morph_selector.value, save_old=False)
 
     def close(self):
-        """Close any open HDF5 handles. Call when the session is torn down."""
         for H in self._h5_handles.values():
             try:
                 H.close()
@@ -209,11 +203,11 @@ class CutoutVetter:
 
         self._restore_from_disk(morph)
 
-        self.n_pages = max(1, int(np.ceil(len(self.gal_keys) / self.n_per_page)))
         self.page = 0
         self.fig = None
         self.axes = None
         self.ax_to_key = {}
+        self._recompute_pagination()
 
         with self.body_output:
             self.body_output.clear_output(wait=True)
@@ -274,6 +268,12 @@ class CutoutVetter:
         )
         self.view_selector.observe(self._on_view_mode_change, names="value")
 
+        self.filter_selector = widgets.ToggleButtons(
+            options=["All", "Unmarked only"],
+            value=self.filter_mode, description="Show:",
+        )
+        self.filter_selector.observe(self._on_filter_change, names="value")
+
         self.morph_btns = {}
         morph_row = []
         for name in self.ALT_MORPHOLOGIES:
@@ -308,7 +308,7 @@ class CutoutVetter:
         self.page_label = widgets.HTML()
 
         self.page_jump = widgets.BoundedIntText(
-            value=1, min=1, max=self.n_pages, description="Go to page:",
+            value=self.page + 1, min=1, max=self.n_pages, description="Go to page:",
             layout=widgets.Layout(width="150px"),
         )
         self.page_jump.observe(self._on_page_jump, names="value")
@@ -317,7 +317,7 @@ class CutoutVetter:
 
         nav_row = widgets.HBox([self.prev_btn, self.page_label, self.next_btn, self.page_jump])
         display(widgets.VBox([
-            self.view_selector,
+            widgets.HBox([self.view_selector, self.filter_selector]),
             nav_row,
             self.plot_output,
             widgets.HBox(morph_row + [self.bad_anchor_btn, self.clear_btn]),
@@ -326,6 +326,21 @@ class CutoutVetter:
             widgets.HBox([self.save_btn, self.exit_btn]),
             self.status,
         ]))
+        self._update_page_label()
+
+    def _on_filter_change(self, change):
+        if getattr(self, "_reverting_filter_change", False):
+            return
+        if self.selected_keys:
+            self._reverting_filter_change = True
+            self.filter_selector.value = change["old"]
+            self._reverting_filter_change = False
+            self.status.value = "<b>Commit or clear your selection before changing the filter.</b>"
+            return
+        self.filter_mode = change["new"]
+        self.page = 0
+        self._recompute_pagination()
+        self._render_page()
 
     def _on_clear_selection(self, _):
         if not self.selected_keys:
@@ -355,20 +370,42 @@ class CutoutVetter:
             self._mark_evaluated(key)
             marked += 1
         self.status.value = f"Marked {marked} remaining galaxy(ies) on this page as correct."
-        if self.fig is not None:
-            self.fig.canvas.draw_idle()
+        self._recompute_pagination()
+        if self.filter_mode == "Unmarked only":
+            self._render_page()   # visible set changed — full re-render needed
+        else:
+            self._update_page_label()
+            if self.fig is not None:
+                self.fig.canvas.draw_idle()
 
     def _on_exit_click(self, _):
         self.save()
         if callable(self.on_exit):
             self.on_exit()
 
-    # ---------- pagination ----------
+    # ---------- filtering + pagination ----------
+
+    def _filtered_keys(self):
+        if self.filter_mode == "Unmarked only":
+            return [k for k in self.gal_keys if self.border_color.get(k) != "red"]
+        return self.gal_keys
 
     def _page_keys(self):
+        keys = self._filtered_keys()
         start = self.page * self.n_per_page
         end = start + self.n_per_page
-        return self.gal_keys[start:end]
+        return keys[start:end]
+
+    def _recompute_pagination(self):
+        total = len(self._filtered_keys())
+        self.n_pages = max(1, int(np.ceil(total / self.n_per_page)))
+        if self.page > self.n_pages - 1:
+            self.page = self.n_pages - 1
+        if hasattr(self, "page_jump"):
+            self._updating_page_jump = True
+            self.page_jump.max = self.n_pages
+            self.page_jump.value = self.page + 1
+            self._updating_page_jump = False
 
     def _on_prev(self, _):
         self._go_to_page(self.page - 1)
@@ -403,14 +440,13 @@ class CutoutVetter:
     # ---------- image loading (threaded, cached, with progress) ----------
 
     def _fetch_image_raw(self, key, view_mode):
-        """Pure fetch, no widget/matplotlib calls — safe to run in a worker thread."""
         sgaid, region = key
         if view_mode == "SSL":
             cutout_key = (region, sgaid)
             if cutout_key not in self.cutout_index:
                 return None
             fname, idx = self.cutout_index[cutout_key]
-            with self._h5_lock:   # HDF5 reads are serialized even though fetch scheduling is parallel
+            with self._h5_lock:
                 H = self._h5_handles.get(fname)
                 if H is None:
                     H = h5py.File(fname, "r")
@@ -421,14 +457,13 @@ class CutoutVetter:
         row = self.rows_by_key.get(key)
         if row is None:
             return None
-    
+
         if self.load_jpg_band_fn is not None:
             try:
-                return self.load_jpg_band_fn(row, view_mode)   # fetch only the active band
+                return self.load_jpg_band_fn(row, view_mode)
             except (KeyError, IndexError, FileNotFoundError):
                 return None
-    
-        # fallback: old 3-tuple API
+
         try:
             model, residual, image = self.load_jpg_fn(row)
         except (KeyError, IndexError, FileNotFoundError):
@@ -436,8 +471,6 @@ class CutoutVetter:
         return {"Model": model, "Residual": residual, "Image": image}
 
     def _prefetch_page_images(self, page_keys):
-        """Concurrently fetch whatever isn't already cached for the current view_mode,
-        showing a live progress bar in plot_output while it works."""
         to_fetch = [k for k in page_keys if (k, self.view_mode) not in self._image_cache]
         if not to_fetch:
             return
@@ -478,14 +511,27 @@ class CutoutVetter:
 
     def _render_page(self):
         page_keys = self._page_keys()
+
+        if not page_keys:
+            with self.plot_output:
+                self.plot_output.clear_output(wait=True)
+                msg = ("🎉 No unmarked galaxies on this page — nice work!"
+                       if self.filter_mode == "Unmarked only" else "No galaxies to show.")
+                display(widgets.HTML(f"<i>{msg}</i>"))
+            self.fig = None
+            self.ax_to_key = {}
+            self._update_page_label()
+            self._sync_page_jump()
+            return
+
         self._prefetch_page_images(page_keys)
 
         with self.plot_output:
             self.plot_output.clear_output(wait=True)
-            display(widgets.HTML("<i>Rendering...</i>"))   # visible the instant fetching finishes
+            display(widgets.HTML("<i>Rendering...</i>"))
 
         ncols = self.ncols if self.ncols else 1
-        nrows = int(np.ceil(len(page_keys) / ncols)) if page_keys else 1
+        nrows = int(np.ceil(len(page_keys) / ncols))
         self.ncols = ncols
 
         with self.plot_output:
@@ -501,7 +547,7 @@ class CutoutVetter:
 
             for ax, key in zip(self.axes, page_keys):
                 sgaid, region = key
-                rgb = self._get_cached_image(key)   # instant — already prefetched
+                rgb = self._get_cached_image(key)
                 if rgb is not None:
                     ax.imshow(rgb, origin="lower")
                 else:
@@ -525,7 +571,6 @@ class CutoutVetter:
             self.fig.canvas.mpl_connect("button_press_event", self._on_click)
             plt.show()
             self.fig.canvas.draw()
-            plt.show()
 
         self._update_page_label()
         self._sync_page_jump()
@@ -543,18 +588,28 @@ class CutoutVetter:
         return None
 
     def _update_page_label(self):
-        start = self.page * self.n_per_page + 1
-        end = min(start + self.n_per_page - 1, len(self.gal_keys))
+        filtered = self._filtered_keys()
+        total = len(filtered)
+        unmarked = sum(1 for k in self.gal_keys if self.border_color.get(k) != "red")
+
+        if total == 0:
+            shown = "0-0 of 0"
+        else:
+            start = self.page * self.n_per_page + 1
+            end = min(start + self.n_per_page - 1, total)
+            shown = f"{start}-{end} of {total}"
+
         self.page_label.value = (
             f"&nbsp;&nbsp;Page {self.page + 1}/{self.n_pages}"
-            f"&nbsp;(showing {start}-{end} of {len(self.gal_keys)})&nbsp;&nbsp;"
+            f"&nbsp;(showing {shown})"
+            f"&nbsp;|&nbsp;<b>{unmarked} unmarked</b> in this morphology&nbsp;&nbsp;"
         )
         self.prev_btn.disabled = (self.page == 0)
         self.next_btn.disabled = (self.page == self.n_pages - 1)
 
     def _on_view_mode_change(self, change):
         self.view_mode = change["new"]
-        self._render_page()   # cheap/no-op prefetch if this mode's images are already cached
+        self._render_page()
 
     def _mark_evaluated(self, key):
         self.state[key] = "reviewed"
@@ -612,7 +667,13 @@ class CutoutVetter:
         self.notes_box.value = ""
         label = "bad anchor" if bad_anchor else alt_morph
         self.status.value = f"Tagged {n} galaxy(ies) as {label}."
-        self.fig.canvas.draw_idle()
+
+        self._recompute_pagination()
+        if self.filter_mode == "Unmarked only":
+            self._render_page()   # tagged galaxies must vanish from an unmarked-only view
+        else:
+            self._update_page_label()
+            self.fig.canvas.draw_idle()
 
     def _on_morph_click(self, name):
         self._apply_to_selection(alt_morph=name)
