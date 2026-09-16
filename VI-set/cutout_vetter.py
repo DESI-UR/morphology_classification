@@ -342,19 +342,6 @@ class CutoutVetter:
         self._recompute_pagination()
         self._render_page()
 
-    def _on_clear_selection(self, _):
-        if not self.selected_keys:
-            return
-        for key in list(self.selected_keys):
-            self.border_color[key] = None
-            ax = self._ax_for_key(key)
-            if ax is not None:
-                self._set_border(ax, None)
-        n = len(self.selected_keys)
-        self.selected_keys.clear()
-        self.status.value = f"Cleared {n} pending selection(s)."
-        self.fig.canvas.draw_idle()
-
     def _on_mark_remaining_correct(self, _):
         page_keys = self._page_keys()
         marked = 0
@@ -623,19 +610,40 @@ class CutoutVetter:
         if ax is None or ax not in self.ax_to_key:
             return
         key = self.ax_to_key[ax]
-
-        if self.border_color.get(key) == "red":
-            return
+        current = self.border_color.get(key)
 
         if key in self.selected_keys:
+            # deselect: revert to whatever it was before selection
             self.selected_keys.discard(key)
-            self.border_color[key] = None
+            self.border_color[key] = "red" if current == "yellow" else None
         else:
             self.selected_keys.add(key)
-            self.border_color[key] = "blue"
+            # clicking an already-reviewed (red) galaxy = re-editing it — warn with yellow
+            self.border_color[key] = "yellow" if current == "red" else "blue"
 
         self._set_border(ax, self.border_color[key])
-        self.status.value = f"{len(self.selected_keys)} galaxy(ies) selected."
+        n_reedit = sum(1 for k in self.selected_keys if self.border_color.get(k) == "yellow")
+        if n_reedit:
+            self.status.value = (
+                f"{len(self.selected_keys)} galaxy(ies) selected "
+                f"(<b>{n_reedit} re-editing an existing vet</b> — this will overwrite it)."
+            )
+        else:
+            self.status.value = f"{len(self.selected_keys)} galaxy(ies) selected."
+        self.fig.canvas.draw_idle()
+
+    def _on_clear_selection(self, _):
+        if not self.selected_keys:
+            return
+        for key in list(self.selected_keys):
+            was_reedit = self.border_color.get(key) == "yellow"
+            self.border_color[key] = "red" if was_reedit else None
+            ax = self._ax_for_key(key)
+            if ax is not None:
+                self._set_border(ax, self.border_color[key])
+        n = len(self.selected_keys)
+        self.selected_keys.clear()
+        self.status.value = f"Cleared {n} pending selection(s)."
         self.fig.canvas.draw_idle()
 
     def _apply_to_selection(self, alt_morph=None, bad_anchor=False):
@@ -644,10 +652,22 @@ class CutoutVetter:
             return
 
         note_text = self.notes_box.value
+        n_reedit = 0
         for key in list(self.selected_keys):
             sgaid, region = key
+            if self.border_color.get(key) == "yellow":
+                n_reedit += 1
             if note_text:
                 self.notes[key] = note_text
+
+            # clear any previous status before applying the new one — necessary
+            # when this is a re-edit of an already-reviewed galaxy, so a stale
+            # bad_anchor/confirmed/reclassified entry doesn't linger and win at save time
+            self.bad_anchors.pop(key, None)
+            self.confirmed.pop(key, None)
+            self.selected_morph.pop(key, None)
+            self.records.pop(key, None)
+
             if bad_anchor:
                 ra, dec = self.radec.get(key, (None, None))
                 self.bad_anchors[key] = {
@@ -655,22 +675,20 @@ class CutoutVetter:
                     "notes": self.notes.get(key, ""),
                     "timestamp": datetime.now(timezone.utc).isoformat(),
                 }
-                self.records.pop(key, None)
-                self.confirmed.pop(key, None)
             else:
                 self.selected_morph[key] = alt_morph
-                self.confirmed.pop(key, None)
-            self._mark_evaluated(key)
+            self._mark_evaluated(key)   # always finalizes to red, whether new or re-edited
 
         n = len(self.selected_keys)
         self.selected_keys.clear()
         self.notes_box.value = ""
         label = "bad anchor" if bad_anchor else alt_morph
-        self.status.value = f"Tagged {n} galaxy(ies) as {label}."
+        suffix = f" ({n_reedit} were re-edits)" if n_reedit else ""
+        self.status.value = f"Tagged {n} galaxy(ies) as {label}{suffix}."
 
         self._recompute_pagination()
         if self.filter_mode == "Unmarked only":
-            self._render_page()   # tagged galaxies must vanish from an unmarked-only view
+            self._render_page()
         else:
             self._update_page_label()
             self.fig.canvas.draw_idle()
@@ -736,7 +754,9 @@ class CutoutVetter:
 
 def confusion_matrix_report(save_dir, morph_options, username=None):
     review_root = os.path.join(save_dir, "anchor_review")
-    if username is not None:
+    if username == "debug":
+        paths = [os.path.join(save_dir, "review_log.csv")]
+    elif username is not None:
         paths = [os.path.join(review_root, username, "review_log.csv")]
     else:
         paths = glob.glob(os.path.join(review_root, "*", "review_log.csv"))
