@@ -1,114 +1,136 @@
 """
-CutoutVetter: interactive click-to-vet grid of galaxy cutouts.
+cutout_vetter.py -- interactive click-to-vet grid of galaxy cutouts, backed by a shared master.
+
+Flow:  username  ->  size bin + mode  ->  vet.   All data handling lives in vetter_data.py.
 """
-import os
-import csv
-import glob
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 
-import numpy as np
-import pandas as pd
 import h5py
-import matplotlib.pyplot as plt
 import ipywidgets as widgets
+import matplotlib.pyplot as plt
+import numpy as np
 from IPython.display import display
 
-
-MASTER_LOG_FIELDNAMES = ["SGAID", "VI_REGION", "RA", "DEC", "morph_reviewed", "status",
-                          "alt_morphology", "notes", "timestamp"]
+from vetter_data import (BAD, LABELS, MODE_AGREED, MODE_UNVETTED, UNKNOWN, SizeBinSource,
+                           VettingStore, confusion_matrix_report, safe_username)
 
 
 class ReviewerLogin:
-    def __init__(self, morph_options, data_lookup_fn, df, cutout_index, sdss_rgb_fn,
-                 load_jpg_fn=None, load_jpg_band_fn=None, initial_morph=None, ncols=4, n_per_page=25,
-                 figsize_per=2, title_fontsize=None, n_workers=8,
-                 save_dir="/global/cfs/cdirs/desicollab/users/qshimp/anchors"):
-        self.morph_options = morph_options
-        self.data_lookup_fn = data_lookup_fn
-        self.df = df
-        self.cutout_index = cutout_index
+    def __init__(self, store, sdss_rgb_fn, size_bins, cutout_index=None, build_cutout_index_fn=None,
+                 load_jpg_fn=None, load_jpg_band_fn=None, ncols=10, n_per_page=50,
+                 figsize_per=2, title_fontsize=None, n_workers=8):
+        """store : VettingStore.   size_bins : list of SizeBinSource.
+        cutout_index : shared {(region, sgaid): (h5_path, row)} index (used when a bin has no ssl_dir).
+        build_cutout_index_fn : callable(ssl_dir) -> index, for bins that carry their own ssl_dir."""
+        self.store = store
+        self.size_bins = {b.label: b for b in size_bins}
         self.sdss_rgb_fn = sdss_rgb_fn
-        self.load_jpg_fn = load_jpg_fn
-        self.load_jpg_band_fn = load_jpg_band_fn
-        self.initial_morph = initial_morph
-        self.ncols = ncols
-        self.n_per_page = n_per_page
-        self.figsize_per = figsize_per
-        self.title_fontsize = title_fontsize
-        self.n_workers = n_workers
-        self.save_dir = save_dir
-
+        self.default_index = cutout_index
+        self.build_cutout_index_fn = build_cutout_index_fn
+        self._index_cache = {}
+        self.vetter_kwargs = dict(load_jpg_fn=load_jpg_fn, load_jpg_band_fn=load_jpg_band_fn,
+                                  ncols=ncols, n_per_page=n_per_page, figsize_per=figsize_per,
+                                  title_fontsize=title_fontsize, n_workers=n_workers)
         self.vetter = None
+        self.username = None
         self.vetter_output = widgets.Output()
 
-        self.title = widgets.HTML("<h2>Galaxy Anchor Review</h2>")
-        self.username_box = widgets.Text(
-            description="Username:", placeholder="Enter your username",
-            layout=widgets.Layout(width="350px"),
-        )
+        # step 1: username
+        self.username_box = widgets.Text(description="Username:", placeholder="Enter your username",
+                                         layout=widgets.Layout(width="350px"))
         self.enter_btn = widgets.Button(description="Enter", button_style="success",
-                                         layout=widgets.Layout(width="100px"))
-        self.status = widgets.HTML(value="<i>Enter your username to begin.</i>")
+                                        layout=widgets.Layout(width="100px"))
+        self.status = widgets.HTML("<i>Enter your username to begin.</i>")
+        self.enter_btn.on_click(lambda _: self._on_enter())
+        self.username_box.on_submit(lambda _: self._on_enter())
+        self.step1 = widgets.VBox([self.username_box, self.enter_btn])
 
-        self.enter_btn.on_click(self._on_enter)
-        self.username_box.on_submit(self._on_username_submit)
+        # step 2: size bin + mode
+        self.bin_dd = widgets.Dropdown(options=list(self.size_bins), description="Size bin:",
+                                       layout=widgets.Layout(width="350px"))
+        self.mode_rb = widgets.RadioButtons(
+            options=[MODE_UNVETTED, MODE_AGREED], description="Vet:",
+            layout=widgets.Layout(width="600px"))
+        self.mode_help = widgets.HTML(
+            f"<small><b>Unvetted</b>: galaxies nobody has vetted yet, starting from the ML-proposed morphology.<br>"
+            f"<b>Agreed</b>: galaxies where other vetters gave the same label "
+            f"and you haven't vetted yet; you confirm or overturn the consensus.</small>")
+        self.start_btn = widgets.Button(description="Start", button_style="success",
+                                        layout=widgets.Layout(width="100px"))
+        self.back_btn = widgets.Button(description="Back", layout=widgets.Layout(width="100px"))
+        self.start_btn.on_click(lambda _: self._on_start())
+        self.back_btn.on_click(lambda _: self._show_step(1))
+        self.step2 = widgets.VBox([self.bin_dd, self.mode_rb, self.mode_help,
+                                   widgets.HBox([self.start_btn, self.back_btn])])
+        self.step2.layout.display = "none"
 
-        self.login_box = widgets.VBox([self.title, self.username_box, self.enter_btn, self.status])
+        self.login_box = widgets.VBox([widgets.HTML("<h2>Galaxy Anchor Review</h2>"),
+                                       self.step1, self.step2, self.status])
         display(widgets.VBox([self.login_box, self.vetter_output]))
 
-    def _on_username_submit(self, _):
-        self._start_review()
+    # ---------------------------------------------------------------- steps
+    def _show_step(self, n):
+        self.step1.layout.display = "" if n == 1 else "none"
+        self.step2.layout.display = "" if n == 2 else "none"
+        self.username_box.disabled = (n == 2)
+        self.status.value = ("<i>Enter your username to begin.</i>" if n == 1 else
+                             f"<i>Hi <b>{self.username}</b> -- choose a size bin and what you want to vet.</i>")
 
-    def _on_enter(self, _):
-        self._start_review()
-
-    def _start_review(self):
-        username = self.username_box.value.strip()
-
-        if not username:
-            self.status.value = "<b>Please enter a username.</b>"
+    def _on_enter(self):
+        try:
+            self.username = safe_username(self.username_box.value)
+        except ValueError as e:
+            self.status.value = f"<b>{e}</b>"
             return
+        self.username_box.value = self.username
+        self._show_step(2)
 
-        invalid_chars = set('/\\:*?"<>|')
-        if any(char in invalid_chars for char in username):
-            self.status.value = "<b>Invalid username.</b> Please avoid / \\ : * ? \" &lt; &gt; |"
+    def _cutout_index_for(self, source):
+        if source.ssl_dir is None:
+            if self.default_index is None:
+                raise ValueError("No shared cutout_index given and this size bin has no ssl_dir.")
+            return self.default_index
+        if source.ssl_dir not in self._index_cache:
+            if self.build_cutout_index_fn is None:
+                raise ValueError("size bin has an ssl_dir but build_cutout_index_fn was not given.")
+            self._index_cache[source.ssl_dir] = self.build_cutout_index_fn(source.ssl_dir)
+        return self._index_cache[source.ssl_dir]
+
+    def _on_start(self):
+        source, mode = self.size_bins[self.bin_dd.value], self.mode_rb.value
+        for w in (self.start_btn, self.back_btn, self.bin_dd, self.mode_rb):
+            w.disabled = True
+        self.status.value = (f"<i>⏳ Loading <b>{source.label}</b> for <b>{self.username}</b> -- "
+                             f"please don't click again.</i>")
+        try:
+            self.store.rebuild_master()                       # make sure the master reflects everyone's latest
+            pool = self.store.build_pool(self.username, source, mode)
+            index = self._cutout_index_for(source)
+        except Exception as e:
+            self.status.value = f"<b>Could not start:</b> {type(e).__name__}: {e}"
+            self._enable_step2()
             return
-
-        self.username_box.disabled = True
-        self.enter_btn.disabled = True
-        self.status.value = (
-            f"<i>⏳ Loading your review session for <b>{username}</b> — this can "
-            f"take a little while on a slow kernel. Please don't click again.</i>"
-        )
-
-        review_dir = os.path.join(self.save_dir, "anchor_review", username)
-        os.makedirs(review_dir, exist_ok=True)
-
-        self.username = username
-        self.review_dir = review_dir
-
+        if len(pool) == 0:
+            hint = (f" Only {pool.attrs['n_vetters_total']} vetter(s) have votes so far; "
+                    f"agreement needs {self.store.min_agree} others." if mode == MODE_AGREED else "")
+            self.status.value = f"<b>Nothing to vet in {source.label} for this mode.</b>{hint}"
+            self._enable_step2()
+            return
+        if pool.attrs.get("n_non_standard_ml_labels"):
+            print(f"Note: {pool.attrs['n_non_standard_ml_labels']:,d} ML labels were not one of {LABELS}; "
+                  f"they are shown as '{UNKNOWN}'.")
         with self.vetter_output:
             self.vetter = CutoutVetter(
-                morph_options=self.morph_options,
-                data_lookup_fn=self.data_lookup_fn,
-                df=self.df,
-                cutout_index=self.cutout_index,
-                sdss_rgb_fn=self.sdss_rgb_fn,
-                load_jpg_fn=self.load_jpg_fn,
-                load_jpg_band_fn=self.load_jpg_band_fn,
-                initial_morph=self.initial_morph,
-                ncols=self.ncols,
-                n_per_page=self.n_per_page,
-                figsize_per=self.figsize_per,
-                title_fontsize=self.title_fontsize,
-                n_workers=self.n_workers,
-                save_dir=self.review_dir,
-                on_exit=self._on_vetter_exit,
-            )
-        self.vetter.username = self.username
+                store=self.store, vetter=self.username, source=source, mode=mode, pool=pool,
+                cutout_index=index, sdss_rgb_fn=self.sdss_rgb_fn, on_exit=self._on_vetter_exit,
+                **self.vetter_kwargs)
         self.login_box.layout.display = "none"
+
+    def _enable_step2(self):
+        for w in (self.start_btn, self.back_btn, self.bin_dd, self.mode_rb):
+            w.disabled = False
 
     def _on_vetter_exit(self):
         if self.vetter is not None:
@@ -116,50 +138,76 @@ class ReviewerLogin:
         self.vetter_output.clear_output()
         self.username_box.value = ""
         self.username_box.disabled = False
-        self.enter_btn.disabled = False
-        self.status.value = "<i>Enter your username to begin.</i>"
+        self._enable_step2()
+        self._show_step(1)
         self.login_box.layout.display = ""
 
 
 class CutoutVetter:
-    ALT_MORPHOLOGIES = ["Elliptical", "Lenticular", "Spiral", "Irregular"]
+    ALT_MORPHOLOGIES = LABELS
 
-    def __init__(self, morph_options, data_lookup_fn, df, cutout_index, sdss_rgb_fn,
-                 load_jpg_fn=None, load_jpg_band_fn=None, initial_morph=None, ncols=4, n_per_page=25, figsize_per=2,
-                 title_fontsize=None, n_workers=8,
-                 save_dir="/pscratch/sd/q/qshimp/Sorter", on_exit=None):
-        self.data_lookup_fn = data_lookup_fn
-        self.df = df
-        self.cutout_index = cutout_index
-        self.load_jpg_fn = load_jpg_fn
-        self.load_jpg_band_fn = load_jpg_band_fn
+    def __init__(self, store, vetter, source, mode, pool, cutout_index, sdss_rgb_fn,
+                 load_jpg_fn=None, load_jpg_band_fn=None, ncols=10, n_per_page=50, figsize_per=2,
+                 title_fontsize=None, n_workers=8, on_exit=None):
+        self.store, self.vetter, self.source, self.mode = store, vetter, source, mode
+        self.pool = pool
         self.sdss_rgb_fn = sdss_rgb_fn
-        self.ncols = ncols
-        self.n_per_page = n_per_page
-        self.figsize_per = figsize_per
+        self.load_jpg_fn, self.load_jpg_band_fn = load_jpg_fn, load_jpg_band_fn
+        self.ncols, self.n_per_page, self.figsize_per = ncols, n_per_page, figsize_per
         self.title_fontsize = title_fontsize or max(6, int(figsize_per * 4))
         self.n_workers = n_workers
-        self.save_dir = save_dir
         self.on_exit = on_exit
         self.view_mode = "Image" if load_jpg_fn is not None else "SSL"
-        self.filter_mode = "All"   # "All" or "Unmarked only" — persists across morphology switches
+        self.filter_mode = "All"
+
+        # SGAID -> (region, sgaid) key into the cutout index (SGAIDs are unique in v1.0)
+        self.sgaid_to_cutout, n_dup = {}, 0
+        for (region, sgaid) in cutout_index:
+            if sgaid in self.sgaid_to_cutout:
+                n_dup += 1
+            else:
+                self.sgaid_to_cutout[sgaid] = (region, sgaid)
+        if n_dup:
+            print(f"WARNING: {n_dup} SGAID(s) appear in both regions of the cutout index; using the first.")
+        self.cutout_index = cutout_index
+
+        sg = pool["SGAID"].to_numpy()
+        self.radec = dict(zip(sg.tolist(), zip(pool["RA"].tolist(), pool["DEC"].tolist())))
+        self.pool_pos = {s: i for i, s in enumerate(sg.tolist())}
+        self.proposed = dict(zip(sg.tolist(), pool["Morphology"].tolist()))
+        self.groups = {}
+        for s, m in zip(sg.tolist(), pool["Morphology"].tolist()):
+            self.groups.setdefault(m, []).append(s)
+        self.source_tag = pool["source"].iloc[0]
+
+        # restore this vetter's earlier votes on galaxies in this pool
+        mine = store.my_votes(vetter)
+        self.votes = {s: {"label": r["label"], "notes": r["notes"]} for s, r in mine.items()
+                      if s in self.pool_pos}
+        self.dirty = set()
+        self.selected = set()
 
         self._image_cache = {}
         self._h5_handles = {}
         self._h5_lock = threading.Lock()
+        self.fig, self.axes, self.ax_to_key = None, None, {}
+        self.page = 0
 
+        order = [m for m in LABELS + [UNKNOWN, BAD] if m in self.groups]
+        order += [m for m in self.groups if m not in order]
         self.morph_selector = widgets.Dropdown(
-            options=morph_options,
-            value=initial_morph or morph_options[0],
-            description="Morphology:",
-        )
+            options=[(f"{m} ({len(self.groups[m]):,d})", m) for m in order], value=order[0],
+            description="Morphology:", layout=widgets.Layout(width="350px"))
+        self.group = self.morph_selector.value
+        self.keys = self.groups[self.group]
         self.morph_selector.observe(self._on_morph_change, names="value")
 
-        self.body_output = widgets.Output()
-        self.top_box = widgets.VBox([self.morph_selector, self.body_output])
-        display(self.top_box)
-
-        self._load_morphology(self.morph_selector.value, save_old=False)
+        header = widgets.HTML(
+            f"<b>{vetter}</b> &middot; size bin <b>{source.label}</b> &middot; {mode} "
+            f"&middot; {len(pool):,d} galaxies")
+        self._build_controls(header)
+        self._recompute_pagination()
+        self._render_page()
 
     def close(self):
         for H in self._h5_handles.values():
@@ -169,156 +217,50 @@ class CutoutVetter:
                 pass
         self._h5_handles.clear()
 
-    # ---------- morphology switching ----------
-
-    def _on_morph_change(self, change):
-        if getattr(self, "_reverting_morph_change", False):
-            return
-        if self.selected_keys:
-            self._reverting_morph_change = True
-            self.morph_selector.value = change["old"]
-            self._reverting_morph_change = False
-            self.status.value = "<b>Commit or clear your selection before switching morphology.</b>"
-            return
-        self._load_morphology(change["new"], save_old=True, old_morph=change["old"])
-
-    def _load_morphology(self, morph, save_old, old_morph=None):
-        if save_old:
-            self.save(morph_override=old_morph)
-
-        data = self.data_lookup_fn(morph, self.df)
-        self.gal_keys = [(int(r["SGAID"]), str(r["VI_REGION"])) for _, r in data.iterrows()]
-        self.radec = {(int(r["SGAID"]), str(r["VI_REGION"])): (float(r["RA"]), float(r["DEC"]))
-                      for _, r in data.iterrows()}
-        self.rows_by_key = {(int(r["SGAID"]), str(r["VI_REGION"])): r for _, r in data.iterrows()}
-
-        self.state = {k: None for k in self.gal_keys}
-        self.selected_keys = set()
-        self.selected_morph = {}
-        self.notes = {}
-        self.border_color = {}
-        self.records = {}
-        self.bad_anchors = {}
-        self.confirmed = {}
-
-        self._restore_from_disk(morph)
-
-        self.page = 0
-        self.fig = None
-        self.axes = None
-        self.ax_to_key = {}
-        self._recompute_pagination()
-
-        with self.body_output:
-            self.body_output.clear_output(wait=True)
-            self.plot_output = widgets.Output()
-            self._build_body_controls()
-        self._render_page()
-
-    def _logfile_path(self):
-        return os.path.join(self.save_dir, "review_log.csv")
-
-    def _restore_from_disk(self, morph):
-        valid_keys = set(self.gal_keys)
-        path = self._logfile_path()
-        if not os.path.exists(path):
-            return
-
-        with open(path, newline="") as fh:
-            for row in csv.DictReader(fh):
-                if row.get("morph_reviewed") != morph:
-                    continue
-                key = (int(row["SGAID"]), row.get("VI_REGION", ""))
-                if key not in valid_keys:
-                    continue
-
-                self.state[key] = "reviewed"
-                self.border_color[key] = "red"
-                if row.get("notes"):
-                    self.notes[key] = row["notes"]
-
-                status = row.get("status")
-                ra, dec = row.get("RA", ""), row.get("DEC", "")
-                sgaid, region = key
-                if status == "reclassified":
-                    if row.get("alt_morphology"):
-                        self.selected_morph[key] = row["alt_morphology"]
-                    self.records[key] = {
-                        "SGAID": sgaid, "VI_REGION": region, "RA": ra, "DEC": dec,
-                        "alt_morphology": row.get("alt_morphology", ""),
-                        "notes": row.get("notes", ""), "timestamp": row.get("timestamp", ""),
-                    }
-                elif status == "bad_anchor":
-                    self.bad_anchors[key] = {
-                        "SGAID": sgaid, "VI_REGION": region, "RA": ra, "DEC": dec,
-                        "notes": row.get("notes", ""), "timestamp": row.get("timestamp", ""),
-                    }
-                elif status == "confirmed_correct":
-                    self.confirmed[key] = {
-                        "SGAID": sgaid, "VI_REGION": region, "RA": ra, "DEC": dec,
-                        "notes": row.get("notes", ""), "timestamp": row.get("timestamp", ""),
-                    }
-
-    # ---------- controls ----------
-
-    def _build_body_controls(self):
+    # ---------------------------------------------------------------- controls
+    def _build_controls(self, header):
         self.view_selector = widgets.ToggleButtons(
             options=["Image", "Model", "Residual", "SSL"] if self.load_jpg_fn is not None else ["SSL"],
-            value=self.view_mode, description="View:",
-        )
+            value=self.view_mode, description="View:")
         self.view_selector.observe(self._on_view_mode_change, names="value")
-
-        self.filter_selector = widgets.ToggleButtons(
-            options=["All", "Unmarked only"],
-            value=self.filter_mode, description="Show:",
-        )
+        self.filter_selector = widgets.ToggleButtons(options=["All", "Unmarked only"],
+                                                     value=self.filter_mode, description="Show:")
         self.filter_selector.observe(self._on_filter_change, names="value")
 
-        self.morph_btns = {}
-        morph_row = []
+        self.morph_btns, morph_row = {}, []
         for name in self.ALT_MORPHOLOGIES:
             b = widgets.Button(description=name)
-            b.on_click(lambda _, n=name: self._on_morph_click(n))
+            b.on_click(lambda _, n=name: self._apply_to_selection(n))
             self.morph_btns[name] = b
             morph_row.append(b)
-
         self.bad_anchor_btn = widgets.Button(description="Bad anchor", button_style="danger")
-        self.bad_anchor_btn.on_click(self._on_bad_anchor)
-
+        self.bad_anchor_btn.on_click(lambda _: self._apply_to_selection(BAD))
         self.clear_btn = widgets.Button(description="Clear selection", button_style="warning")
         self.clear_btn.on_click(self._on_clear_selection)
-
         self.mark_remaining_btn = widgets.Button(description="Affirm All", button_style="info")
         self.mark_remaining_btn.on_click(self._on_mark_remaining_correct)
-
-        self.notes_box = widgets.Textarea(
-            placeholder="Notes for the selected galaxies...",
-            layout=widgets.Layout(width="400px", height="60px"),
-        )
+        self.notes_box = widgets.Textarea(placeholder="Notes for the selected galaxies...",
+                                          layout=widgets.Layout(width="400px", height="60px"))
         self.save_btn = widgets.Button(description="Save", button_style="success")
-        self.save_btn.on_click(self._on_save)
-
+        self.save_btn.on_click(lambda _: self.save())
         self.exit_btn = widgets.Button(description="Exit", button_style="danger")
         self.exit_btn.on_click(self._on_exit_click)
 
         self.prev_btn = widgets.Button(description="← Previous")
-        self.prev_btn.on_click(self._on_prev)
+        self.prev_btn.on_click(lambda _: self._go_to_page(self.page - 1))
         self.next_btn = widgets.Button(description="Next →")
-        self.next_btn.on_click(self._on_next)
+        self.next_btn.on_click(lambda _: self._go_to_page(self.page + 1))
         self.page_label = widgets.HTML()
-
-        self.page_jump = widgets.BoundedIntText(
-            value=self.page + 1, min=1, max=self.n_pages, description="Go to page:",
-            layout=widgets.Layout(width="150px"),
-        )
+        self.page_jump = widgets.BoundedIntText(value=1, min=1, max=1, description="Go to page:",
+                                                layout=widgets.Layout(width="150px"))
         self.page_jump.observe(self._on_page_jump, names="value")
+        self.status = widgets.HTML("<i>Click a galaxy to select it.</i>")
+        self.plot_output = widgets.Output()
 
-        self.status = widgets.HTML(value="<i>Click a galaxy to select it.</i>")
-
-        nav_row = widgets.HBox([self.prev_btn, self.page_label, self.next_btn, self.page_jump])
         display(widgets.VBox([
+            header, self.morph_selector,
             widgets.HBox([self.view_selector, self.filter_selector]),
-            nav_row,
+            widgets.HBox([self.prev_btn, self.page_label, self.next_btn, self.page_jump]),
             self.plot_output,
             widgets.HBox(morph_row + [self.bad_anchor_btn, self.clear_btn]),
             widgets.HBox([self.mark_remaining_btn]),
@@ -326,12 +268,28 @@ class CutoutVetter:
             widgets.HBox([self.save_btn, self.exit_btn]),
             self.status,
         ]))
-        self._update_page_label()
+
+    # ---------------------------------------------------------------- morphology group switching
+    def _on_morph_change(self, change):
+        if getattr(self, "_reverting_morph_change", False):
+            return
+        if self.selected:
+            self._reverting_morph_change = True
+            self.morph_selector.value = change["old"]
+            self._reverting_morph_change = False
+            self.status.value = "<b>Commit or clear your selection before switching morphology.</b>"
+            return
+        self.save()
+        self.group = change["new"]
+        self.keys = self.groups[self.group]
+        self.page = 0
+        self._recompute_pagination()
+        self._render_page()
 
     def _on_filter_change(self, change):
         if getattr(self, "_reverting_filter_change", False):
             return
-        if self.selected_keys:
+        if self.selected:
             self._reverting_filter_change = True
             self.filter_selector.value = change["old"]
             self._reverting_filter_change = False
@@ -342,115 +300,87 @@ class CutoutVetter:
         self._recompute_pagination()
         self._render_page()
 
-    def _on_mark_remaining_correct(self, _):
-        page_keys = self._page_keys()
-        marked = 0
-        for key in page_keys:
-            if self.border_color.get(key) is not None:
-                continue
-            sgaid, region = key
-            ra, dec = self.radec.get(key, (None, None))
-            self.confirmed[key] = {
-                "SGAID": sgaid, "VI_REGION": region, "RA": ra, "DEC": dec,
-                "notes": "", "timestamp": datetime.now(timezone.utc).isoformat(),
-            }
-            self._mark_evaluated(key)
-            marked += 1
-        self.status.value = f"Marked {marked} remaining galaxy(ies) on this page as correct."
-        self._recompute_pagination()
-        if self.filter_mode == "Unmarked only":
-            self._render_page()   # visible set changed — full re-render needed
-        else:
-            self._update_page_label()
-            if self.fig is not None:
-                self.fig.canvas.draw_idle()
+    def _on_view_mode_change(self, change):
+        self.view_mode = change["new"]
+        self._render_page()
 
-    def _on_exit_click(self, _):
-        self.save()
-        if callable(self.on_exit):
-            self.on_exit()
-
-    # ---------- filtering + pagination ----------
-
+    # ---------------------------------------------------------------- pagination
     def _filtered_keys(self):
         if self.filter_mode == "Unmarked only":
-            return [k for k in self.gal_keys if self.border_color.get(k) != "red"]
-        return self.gal_keys
+            return [k for k in self.keys if k not in self.votes]
+        return self.keys
 
     def _page_keys(self):
         keys = self._filtered_keys()
-        start = self.page * self.n_per_page
-        end = start + self.n_per_page
-        return keys[start:end]
+        return keys[self.page * self.n_per_page:(self.page + 1) * self.n_per_page]
 
     def _recompute_pagination(self):
         total = len(self._filtered_keys())
         self.n_pages = max(1, int(np.ceil(total / self.n_per_page)))
-        if self.page > self.n_pages - 1:
-            self.page = self.n_pages - 1
-        if hasattr(self, "page_jump"):
-            self._updating_page_jump = True
+        self.page = min(self.page, self.n_pages - 1)
+        self._sync_page_jump(update_max=True)
+
+    def _sync_page_jump(self, update_max=False):
+        self._updating_page_jump = True
+        if update_max:
             self.page_jump.max = self.n_pages
-            self.page_jump.value = self.page + 1
-            self._updating_page_jump = False
-
-    def _on_prev(self, _):
-        self._go_to_page(self.page - 1)
-
-    def _on_next(self, _):
-        self._go_to_page(self.page + 1)
+        self.page_jump.value = self.page + 1
+        self._updating_page_jump = False
 
     def _on_page_jump(self, change):
-        if getattr(self, "_updating_page_jump", False):
-            return
-        self._go_to_page(change["new"] - 1)
+        if not getattr(self, "_updating_page_jump", False):
+            self._go_to_page(change["new"] - 1)
 
     def _go_to_page(self, new_page):
         new_page = max(0, min(new_page, self.n_pages - 1))
         if new_page == self.page:
             self._sync_page_jump()
             return
-        if self.selected_keys:
+        if self.selected:
             self.status.value = "<b>Commit or clear your selection before changing pages.</b>"
             self._sync_page_jump()
             return
         self.page = new_page
         self._render_page()
 
-    def _sync_page_jump(self):
-        if not hasattr(self, "page_jump"):
-            return
-        self._updating_page_jump = True
-        self.page_jump.value = self.page + 1
-        self._updating_page_jump = False
+    def _update_page_label(self):
+        total = len(self._filtered_keys())
+        if total == 0:
+            shown = "0-0 of 0"
+        else:
+            start = self.page * self.n_per_page + 1
+            shown = f"{start}-{min(start + self.n_per_page - 1, total)} of {total}"
+        unmarked = sum(1 for k in self.keys if k not in self.votes)
+        self.page_label.value = (f"&nbsp;&nbsp;Page {self.page + 1}/{self.n_pages}&nbsp;(showing {shown})"
+                                 f"&nbsp;|&nbsp;<b>{unmarked} unmarked</b> in this group"
+                                 f"&nbsp;|&nbsp;{len(self.dirty)} unsaved&nbsp;&nbsp;")
+        self.prev_btn.disabled = (self.page == 0)
+        self.next_btn.disabled = (self.page == self.n_pages - 1)
 
-    # ---------- image loading (threaded, cached, with progress) ----------
+    # ---------------------------------------------------------------- images
+    def _row(self, key):
+        d = self.pool.iloc[self.pool_pos[key]].to_dict()
+        return d
 
     def _fetch_image_raw(self, key, view_mode):
-        sgaid, region = key
         if view_mode == "SSL":
-            cutout_key = (region, sgaid)
-            if cutout_key not in self.cutout_index:
+            ckey = self.sgaid_to_cutout.get(key)
+            if ckey is None:
                 return None
-            fname, idx = self.cutout_index[cutout_key]
+            fname, idx = self.cutout_index[ckey]
             with self._h5_lock:
                 H = self._h5_handles.get(fname)
                 if H is None:
                     H = h5py.File(fname, "r")
                     self._h5_handles[fname] = H
                 img = H["images"][idx]
-                return self.sdss_rgb_fn([img[0], img[1], img[2]], ["g", "r", "z"])
-
-        row = self.rows_by_key.get(key)
-        if row is None:
-            return None
-
+            return self.sdss_rgb_fn([img[0], img[1], img[2]], ["g", "r", "z"])
+        row = self._row(key)
         if self.load_jpg_band_fn is not None:
             try:
                 return self.load_jpg_band_fn(row, view_mode)
             except (KeyError, IndexError, FileNotFoundError):
                 return None
-
         try:
             model, residual, image = self.load_jpg_fn(row)
         except (KeyError, IndexError, FileNotFoundError):
@@ -461,106 +391,33 @@ class CutoutVetter:
         to_fetch = [k for k in page_keys if (k, self.view_mode) not in self._image_cache]
         if not to_fetch:
             return
-
-        progress = widgets.IntProgress(
-            value=0, min=0, max=len(to_fetch), bar_style="info",
-            layout=widgets.Layout(width="400px"),
-        )
-        progress_label = widgets.HTML(value=f"Loading images: 0 / {len(to_fetch)} (0%)")
+        progress = widgets.IntProgress(value=0, min=0, max=len(to_fetch), bar_style="info",
+                                       layout=widgets.Layout(width="400px"))
+        label = widgets.HTML(f"Loading images: 0 / {len(to_fetch)} (0%)")
         with self.plot_output:
             self.plot_output.clear_output(wait=True)
-            display(widgets.VBox([progress_label, progress]))
-
-        with ThreadPoolExecutor(max_workers=self.n_workers) as executor:
-            futures = {executor.submit(self._fetch_image_raw, key, self.view_mode): key
-                      for key in to_fetch}
-            for i, future in enumerate(as_completed(futures), start=1):
-                key = futures[future]
+            display(widgets.VBox([label, progress]))
+        with ThreadPoolExecutor(max_workers=self.n_workers) as ex:
+            futures = {ex.submit(self._fetch_image_raw, k, self.view_mode): k for k in to_fetch}
+            for i, fut in enumerate(as_completed(futures), start=1):
+                key = futures[fut]
                 try:
-                    result = future.result()
+                    result = fut.result()
                 except Exception:
                     result = None
-
                 if isinstance(result, dict):
                     for band, arr in result.items():
                         self._image_cache[(key, band)] = arr
                 else:
                     self._image_cache[(key, self.view_mode)] = result
-
                 progress.value = i
-                pct = int(100 * i / len(to_fetch))
-                progress_label.value = f"Loading images: {i} / {len(to_fetch)} ({pct}%)"
+                label.value = f"Loading images: {i} / {len(to_fetch)} ({int(100 * i / len(to_fetch))}%)"
 
-    def _get_cached_image(self, key):
-        return self._image_cache.get((key, self.view_mode))
-
-    # ---------- figure rendering ----------
-
-    def _render_page(self):
-        page_keys = self._page_keys()
-
-        if not page_keys:
-            with self.plot_output:
-                self.plot_output.clear_output(wait=True)
-                msg = ("🎉 No unmarked galaxies on this page — nice work!"
-                       if self.filter_mode == "Unmarked only" else "No galaxies to show.")
-                display(widgets.HTML(f"<i>{msg}</i>"))
-            self.fig = None
-            self.ax_to_key = {}
-            self._update_page_label()
-            self._sync_page_jump()
-            return
-
-        self._prefetch_page_images(page_keys)
-
-        with self.plot_output:
-            self.plot_output.clear_output(wait=True)
-            display(widgets.HTML("<i>Rendering...</i>"))
-
-        ncols = self.ncols if self.ncols else 1
-        nrows = int(np.ceil(len(page_keys) / ncols))
-        self.ncols = ncols
-
-        with self.plot_output:
-            self.plot_output.clear_output(wait=True)
-            if self.fig is not None:
-                plt.close(self.fig)
-
-            self.fig, axes = plt.subplots(
-                nrows, ncols, figsize=(ncols * self.figsize_per, nrows * self.figsize_per)
-            )
-            self.axes = np.array(axes).ravel()
-            self.ax_to_key = {}
-
-            for ax, key in zip(self.axes, page_keys):
-                sgaid, region = key
-                rgb = self._get_cached_image(key)
-                if rgb is not None:
-                    ax.imshow(rgb, origin="lower")
-                else:
-                    ax.text(0.5, 0.5, f"SGAID\n{sgaid}\n[{region}]\nnot found",
-                            ha="center", va="center", transform=ax.transAxes, fontsize=7)
-
-                title = (f"{sgaid} ({self.radec[key][0]:.4f}, {self.radec[key][1]:.4f})"
-                         if key in self.radec else f"{sgaid} [{region}]")
-                ax.set_title(title, fontsize=self.title_fontsize)
-                ax.set_xticks([]); ax.set_yticks([])
-                for spine in ax.spines.values():
-                    spine.set_visible(True)
-                    spine.set_linewidth(3)
-                self._set_border(ax, self.border_color.get(key))
-                self.ax_to_key[ax] = key
-
-            for ax in self.axes[len(page_keys):]:
-                ax.axis("off")
-
-            self.fig.tight_layout()
-            self.fig.canvas.mpl_connect("button_press_event", self._on_click)
-            plt.show()
-            self.fig.canvas.draw()
-
-        self._update_page_label()
-        self._sync_page_jump()
+    # ---------------------------------------------------------------- rendering
+    def _color(self, key):
+        if key in self.selected:
+            return "yellow" if key in self.votes else "blue"
+        return "red" if key in self.votes else None
 
     def _set_border(self, ax, color):
         for spine in ax.spines.values():
@@ -574,215 +431,148 @@ class CutoutVetter:
                 return ax
         return None
 
-    def _update_page_label(self):
-        filtered = self._filtered_keys()
-        total = len(filtered)
-        unmarked = sum(1 for k in self.gal_keys if self.border_color.get(k) != "red")
+    def _render_page(self):
+        page_keys = self._page_keys()
+        if not page_keys:
+            with self.plot_output:
+                self.plot_output.clear_output(wait=True)
+                msg = ("🎉 No unmarked galaxies in this group -- nice work!"
+                       if self.filter_mode == "Unmarked only" else "No galaxies to show.")
+                display(widgets.HTML(f"<i>{msg}</i>"))
+            self.fig, self.ax_to_key = None, {}
+            self._update_page_label()
+            self._sync_page_jump()
+            return
 
-        if total == 0:
-            shown = "0-0 of 0"
-        else:
-            start = self.page * self.n_per_page + 1
-            end = min(start + self.n_per_page - 1, total)
-            shown = f"{start}-{end} of {total}"
+        self._prefetch_page_images(page_keys)
+        ncols = self.ncols or 1
+        nrows = int(np.ceil(len(page_keys) / ncols))
+        with self.plot_output:
+            self.plot_output.clear_output(wait=True)
+            if self.fig is not None:
+                plt.close(self.fig)
+            self.fig, axes = plt.subplots(nrows, ncols,
+                                          figsize=(ncols * self.figsize_per, nrows * self.figsize_per))
+            self.axes = np.array(axes).ravel()
+            self.ax_to_key = {}
+            for ax, key in zip(self.axes, page_keys):
+                rgb = self._image_cache.get((key, self.view_mode))
+                if rgb is not None:
+                    ax.imshow(rgb, origin="lower")
+                else:
+                    ax.text(0.5, 0.5, f"SGAID\n{key}\nnot found", ha="center", va="center",
+                            transform=ax.transAxes, fontsize=7)
+                ra, dec = self.radec[key]
+                ax.set_title(f"{key} ({ra:.4f}, {dec:.4f})" if ra == ra else f"{key}",
+                             fontsize=self.title_fontsize)
+                ax.set_xticks([]); ax.set_yticks([])
+                self._set_border(ax, self._color(key))
+                self.ax_to_key[ax] = key
+            for ax in self.axes[len(page_keys):]:
+                ax.axis("off")
+            self.fig.tight_layout()
+            self.fig.canvas.mpl_connect("button_press_event", self._on_click)
+            plt.show()
+            self.fig.canvas.draw()
+        self._update_page_label()
+        self._sync_page_jump()
 
-        self.page_label.value = (
-            f"&nbsp;&nbsp;Page {self.page + 1}/{self.n_pages}"
-            f"&nbsp;(showing {shown})"
-            f"&nbsp;|&nbsp;<b>{unmarked} unmarked</b> in this morphology&nbsp;&nbsp;"
-        )
-        self.prev_btn.disabled = (self.page == 0)
-        self.next_btn.disabled = (self.page == self.n_pages - 1)
-
-    def _on_view_mode_change(self, change):
-        self.view_mode = change["new"]
-        self._render_page()
-
-    def _mark_evaluated(self, key):
-        self.state[key] = "reviewed"
-        self.border_color[key] = "red"
-        ax = self._ax_for_key(key)
-        if ax is not None:
-            self._set_border(ax, "red")
-
+    # ---------------------------------------------------------------- interaction
     def _on_click(self, event):
         ax = event.inaxes
         if ax is None or ax not in self.ax_to_key:
             return
         key = self.ax_to_key[ax]
-        current = self.border_color.get(key)
-
-        if key in self.selected_keys:
-            # deselect: revert to whatever it was before selection
-            self.selected_keys.discard(key)
-            self.border_color[key] = "red" if current == "yellow" else None
-        else:
-            self.selected_keys.add(key)
-            # clicking an already-reviewed (red) galaxy = re-editing it — warn with yellow
-            self.border_color[key] = "yellow" if current == "red" else "blue"
-
-        self._set_border(ax, self.border_color[key])
-        n_reedit = sum(1 for k in self.selected_keys if self.border_color.get(k) == "yellow")
+        self.selected.symmetric_difference_update({key})
+        self._set_border(ax, self._color(key))
+        n_reedit = sum(1 for k in self.selected if k in self.votes)
+        msg = f"{len(self.selected)} galaxy(ies) selected."
         if n_reedit:
-            self.status.value = (
-                f"{len(self.selected_keys)} galaxy(ies) selected "
-                f"(<b>{n_reedit} re-editing an existing vet</b> — this will overwrite it)."
-            )
-        else:
-            self.status.value = f"{len(self.selected_keys)} galaxy(ies) selected."
+            msg = (f"{len(self.selected)} galaxy(ies) selected "
+                   f"(<b>{n_reedit} re-editing an existing vet</b> -- this will overwrite it).")
+        self.status.value = msg
         self.fig.canvas.draw_idle()
 
     def _on_clear_selection(self, _):
-        if not self.selected_keys:
+        if not self.selected:
             return
-        for key in list(self.selected_keys):
-            was_reedit = self.border_color.get(key) == "yellow"
-            self.border_color[key] = "red" if was_reedit else None
+        n = len(self.selected)
+        cleared, self.selected = list(self.selected), set()
+        for key in cleared:
             ax = self._ax_for_key(key)
             if ax is not None:
-                self._set_border(ax, self.border_color[key])
-        n = len(self.selected_keys)
-        self.selected_keys.clear()
+                self._set_border(ax, self._color(key))
         self.status.value = f"Cleared {n} pending selection(s)."
         self.fig.canvas.draw_idle()
 
-    def _apply_to_selection(self, alt_morph=None, bad_anchor=False):
-        if not self.selected_keys:
-            self.status.value = "<b>Select at least one galaxy first.</b>"
-            return
+    def _vote(self, key, label, notes=""):
+        self.votes[key] = {"label": label, "notes": notes}
+        self.dirty.add(key)
 
-        note_text = self.notes_box.value
-        n_reedit = 0
-        for key in list(self.selected_keys):
-            sgaid, region = key
-            if self.border_color.get(key) == "yellow":
-                n_reedit += 1
-            if note_text:
-                self.notes[key] = note_text
-
-            # clear any previous status before applying the new one — necessary
-            # when this is a re-edit of an already-reviewed galaxy, so a stale
-            # bad_anchor/confirmed/reclassified entry doesn't linger and win at save time
-            self.bad_anchors.pop(key, None)
-            self.confirmed.pop(key, None)
-            self.selected_morph.pop(key, None)
-            self.records.pop(key, None)
-
-            if bad_anchor:
-                ra, dec = self.radec.get(key, (None, None))
-                self.bad_anchors[key] = {
-                    "SGAID": sgaid, "VI_REGION": region, "RA": ra, "DEC": dec,
-                    "notes": self.notes.get(key, ""),
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
-                }
-            else:
-                self.selected_morph[key] = alt_morph
-            self._mark_evaluated(key)   # always finalizes to red, whether new or re-edited
-
-        n = len(self.selected_keys)
-        self.selected_keys.clear()
-        self.notes_box.value = ""
-        label = "bad anchor" if bad_anchor else alt_morph
-        suffix = f" ({n_reedit} were re-edits)" if n_reedit else ""
-        self.status.value = f"Tagged {n} galaxy(ies) as {label}{suffix}."
-
+    def _after_marking(self):
         self._recompute_pagination()
         if self.filter_mode == "Unmarked only":
             self._render_page()
         else:
             self._update_page_label()
-            self.fig.canvas.draw_idle()
+            if self.fig is not None:
+                self.fig.canvas.draw_idle()
 
-    def _on_morph_click(self, name):
-        self._apply_to_selection(alt_morph=name)
+    def _apply_to_selection(self, label):
+        if not self.selected:
+            self.status.value = "<b>Select at least one galaxy first.</b>"
+            return
+        note = self.notes_box.value
+        n_reedit = sum(1 for k in self.selected if k in self.votes)
+        done, self.selected = list(self.selected), set()
+        for key in done:
+            self._vote(key, label, note)
+            ax = self._ax_for_key(key)
+            if ax is not None:
+                self._set_border(ax, self._color(key))
+        self.notes_box.value = ""
+        suffix = f" ({n_reedit} were re-edits)" if n_reedit else ""
+        self.status.value = f"Tagged {len(done)} galaxy(ies) as {label}{suffix}."
+        self._after_marking()
 
-    def _on_bad_anchor(self, _):
-        self._apply_to_selection(bad_anchor=True)
+    def _on_mark_remaining_correct(self, _):
+        if self.group == UNKNOWN:
+            self.status.value = ("<b>Nothing to affirm:</b> these galaxies have no proposed morphology. "
+                                 "Select them and choose a label.")
+            return
+        marked = 0
+        for key in self._page_keys():
+            if key in self.votes or key in self.selected:
+                continue
+            self._vote(key, self.group)                         # affirming == agreeing with the proposal
+            ax = self._ax_for_key(key)
+            if ax is not None:
+                self._set_border(ax, self._color(key))
+            marked += 1
+        self.status.value = f"Affirmed {marked} remaining galaxy(ies) on this page as {self.group}."
+        self._after_marking()
 
-    def save(self, morph_override=None):
-        morph = morph_override if morph_override is not None else self.morph_selector.value
+    # ---------------------------------------------------------------- saving
+    def save(self):
+        if not self.dirty:
+            self.status.value = "Nothing new to save."
+            return
         now = datetime.now(timezone.utc).isoformat()
-        new_rows = {}
+        rows = [{"SGAID": k, "label": self.votes[k]["label"], "proposed": self.proposed[k],
+                 "source": self.source_tag, "size_bin": self.source.label,
+                 "notes": self.votes[k]["notes"], "timestamp": now} for k in sorted(self.dirty)]
+        try:
+            n = self.store.save_votes(self.vetter, rows)
+        except Exception as e:                                  # keep votes in memory, tell the user
+            self.status.value = f"<b>SAVE FAILED</b> ({type(e).__name__}: {e}). Your votes are still in memory -- try Save again."
+            return
+        self.dirty.clear()
+        self.status.value = f"Saved {n} vote(s). Master updated: {self.store.master_path}"
+        self._update_page_label()
 
-        for key, color in self.border_color.items():
-            if color != "red":
-                continue
-            sgaid, region = key
-            ra, dec = self.radec.get(key, (None, None))
-            if key in self.bad_anchors:
-                status, alt = "bad_anchor", ""
-            elif key in self.confirmed:
-                status, alt = "confirmed_correct", ""
-            elif self.selected_morph.get(key) is not None:
-                status, alt = "reclassified", self.selected_morph[key]
-            else:
-                continue
-
-            new_rows[key] = {
-                "SGAID": sgaid, "VI_REGION": region, "RA": ra, "DEC": dec,
-                "morph_reviewed": morph, "status": status,
-                "alt_morphology": alt, "notes": self.notes.get(key, ""),
-                "timestamp": now,
-            }
-
-        path = self._logfile_path()
-        self._write_master_log(path, new_rows)
-        self.status.value = f"Saved {len(new_rows)} record(s) to {path}."
-
-    def _on_save(self, _):
+    def _on_exit_click(self, _):
         self.save()
-
-    @staticmethod
-    def _write_master_log(path, new_rows):
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        existing = {}
-        if os.path.exists(path):
-            with open(path, newline="") as fh:
-                for row in csv.DictReader(fh):
-                    existing[(row["SGAID"], row["VI_REGION"])] = row
-
-        for key, v in new_rows.items():
-            sgaid, region = key
-            existing[(str(sgaid), region)] = {fn: v.get(fn, "") for fn in MASTER_LOG_FIELDNAMES}
-
-        with open(path, "w", newline="") as fh:
-            writer = csv.DictWriter(fh, fieldnames=MASTER_LOG_FIELDNAMES)
-            writer.writeheader()
-            for row in existing.values():
-                writer.writerow(row)
-
-
-def confusion_matrix_report(save_dir, morph_options, username=None):
-    review_root = os.path.join(save_dir, "anchor_review")
-    if username == "debug":
-        paths = [os.path.join(save_dir, "review_log.csv")]
-    elif username is not None:
-        paths = [os.path.join(review_root, username, "review_log.csv")]
-    else:
-        paths = glob.glob(os.path.join(review_root, "*", "review_log.csv"))
-
-    columns = list(morph_options) + ["Bad anchor"]
-    matrix = pd.DataFrame(0, index=morph_options, columns=columns)
-
-    for path in paths:
-        if not os.path.exists(path):
-            continue
-        with open(path, newline="") as fh:
-            for row in csv.DictReader(fh):
-                orig = row.get("morph_reviewed")
-                if orig not in matrix.index:
-                    continue
-                status = row.get("status")
-                if status == "confirmed_correct":
-                    col = orig
-                elif status == "reclassified":
-                    col = row.get("alt_morphology")
-                elif status == "bad_anchor":
-                    col = "Bad anchor"
-                else:
-                    continue
-                if col not in matrix.columns:
-                    continue
-                matrix.loc[orig, col] += 1
-
-    return matrix
+        if self.dirty:                                           # save failed -- don't throw the votes away
+            return
+        if callable(self.on_exit):
+            self.on_exit()
