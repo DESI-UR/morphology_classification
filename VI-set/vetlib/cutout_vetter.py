@@ -1,7 +1,7 @@
 """
 cutout_vetter.py -- interactive click-to-vet grid of galaxy cutouts, backed by a shared master.
 
-Flow:  username  ->  size bin + mode  ->  vet.   All data handling lives in vetter_data.py.
+Flow:  username  ->  size bin + mode  ->  vet.   All data handling lives in vetting_store.py.
 """
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -13,14 +13,15 @@ import matplotlib.pyplot as plt
 import numpy as np
 from IPython.display import display
 
-from vetter_data import (BAD, LABELS, MODE_AGREED, MODE_UNVETTED, UNKNOWN, SizeBinSource,
+from vetlib.coadd_cutouts import CoaddIndex
+from vetlib.vetter_data import (BAD, LABELS, MODE_AGREED, MODE_UNVETTED, UNKNOWN, SizeBinSource,
                            VettingStore, confusion_matrix_report, safe_username)
 
 
 class ReviewerLogin:
     def __init__(self, store, sdss_rgb_fn, size_bins, cutout_index=None, build_cutout_index_fn=None,
                  load_jpg_fn=None, load_jpg_band_fn=None, ncols=10, n_per_page=50,
-                 figsize_per=2, title_fontsize=None, n_workers=8):
+                 figsize_per=2, title_fontsize=None, n_workers=8, jpg_service=None):
         """store : VettingStore.   size_bins : list of SizeBinSource.
         cutout_index : shared {(region, sgaid): (h5_path, row)} index (used when a bin has no ssl_dir).
         build_cutout_index_fn : callable(ssl_dir) -> index, for bins that carry their own ssl_dir."""
@@ -30,7 +31,9 @@ class ReviewerLogin:
         self.default_index = cutout_index
         self.build_cutout_index_fn = build_cutout_index_fn
         self._index_cache = {}
+        self._coadd_cache = {}
         self.vetter_kwargs = dict(load_jpg_fn=load_jpg_fn, load_jpg_band_fn=load_jpg_band_fn,
+                                  jpg_service=jpg_service,
                                   ncols=ncols, n_per_page=n_per_page, figsize_per=figsize_per,
                                   title_fontsize=title_fontsize, n_workers=n_workers)
         self.vetter = None
@@ -55,8 +58,9 @@ class ReviewerLogin:
             layout=widgets.Layout(width="600px"))
         self.mode_help = widgets.HTML(
             f"<small><b>Unvetted</b>: galaxies nobody has vetted yet, starting from the ML-proposed morphology.<br>"
-            f"<b>Agreed</b>: galaxies where other vetters gave the same label "
-            f"and you haven't vetted yet; you confirm or overturn the consensus.</small>")
+            f"<b>Agreed</b>: galaxies that have been vetted by others, where <i>every</i> vote so far is the same "
+            f"label (one vote counts; any disagreement hides it), and you haven't vetted yet. "
+            f"Ordered by how many others agree (most first), so you start with the clearest examples.</small>")
         self.start_btn = widgets.Button(description="Start", button_style="success",
                                         layout=widgets.Layout(width="100px"))
         self.back_btn = widgets.Button(description="Back", layout=widgets.Layout(width="100px"))
@@ -98,6 +102,16 @@ class ReviewerLogin:
             self._index_cache[source.ssl_dir] = self.build_cutout_index_fn(source.ssl_dir)
         return self._index_cache[source.ssl_dir]
 
+    def _coadd_index_for(self, source):
+        """One CoaddIndex per bin folder, kept for the whole notebook session and refreshed on Start."""
+        if not getattr(source, "coadd_dir", None):
+            return None
+        if source.coadd_dir not in self._coadd_cache:
+            self._coadd_cache[source.coadd_dir] = CoaddIndex(source.coadd_dir)
+        idx = self._coadd_cache[source.coadd_dir]
+        idx.refresh(force=True)
+        return idx
+
     def _on_start(self):
         source, mode = self.size_bins[self.bin_dd.value], self.mode_rb.value
         for w in (self.start_btn, self.back_btn, self.bin_dd, self.mode_rb):
@@ -108,23 +122,29 @@ class ReviewerLogin:
             self.store.rebuild_master()                       # make sure the master reflects everyone's latest
             pool = self.store.build_pool(self.username, source, mode)
             index = self._cutout_index_for(source)
+            coadd = self._coadd_index_for(source)
         except Exception as e:
             self.status.value = f"<b>Could not start:</b> {type(e).__name__}: {e}"
             self._enable_step2()
             return
         if len(pool) == 0:
             hint = (f" Only {pool.attrs['n_vetters_total']} vetter(s) have votes so far; "
-                    f"agreement needs {self.store.min_agree} others." if mode == MODE_AGREED else "")
+                    f"no galaxy yet has votes from others that all agree." if mode == MODE_AGREED else "")
             self.status.value = f"<b>Nothing to vet in {source.label} for this mode.</b>{hint}"
             self._enable_step2()
             return
         if pool.attrs.get("n_non_standard_ml_labels"):
             print(f"Note: {pool.attrs['n_non_standard_ml_labels']:,d} ML labels were not one of {LABELS}; "
                   f"they are shown as '{UNKNOWN}'.")
+        if coadd is not None:
+            have, tot = coadd.coverage(pool["SGAID"])
+            print(f"Coadd cutouts cover {have:,d} of {tot:,d} galaxies in this pool ({100 * have / max(tot, 1):.1f}%); "
+                  f"the rest show 'not found' in the Coadd view.")
         with self.vetter_output:
             self.vetter = CutoutVetter(
                 store=self.store, vetter=self.username, source=source, mode=mode, pool=pool,
-                cutout_index=index, sdss_rgb_fn=self.sdss_rgb_fn, on_exit=self._on_vetter_exit,
+                cutout_index=index, coadd_index=coadd, sdss_rgb_fn=self.sdss_rgb_fn,
+                on_exit=self._on_vetter_exit,
                 **self.vetter_kwargs)
         self.login_box.layout.display = "none"
 
@@ -148,11 +168,13 @@ class CutoutVetter:
 
     def __init__(self, store, vetter, source, mode, pool, cutout_index, sdss_rgb_fn,
                  load_jpg_fn=None, load_jpg_band_fn=None, ncols=10, n_per_page=50, figsize_per=2,
-                 title_fontsize=None, n_workers=8, on_exit=None):
+                 title_fontsize=None, n_workers=8, on_exit=None, jpg_service=None, coadd_index=None):
         self.store, self.vetter, self.source, self.mode = store, vetter, source, mode
         self.pool = pool
         self.sdss_rgb_fn = sdss_rgb_fn
         self.load_jpg_fn, self.load_jpg_band_fn = load_jpg_fn, load_jpg_band_fn
+        self.jpg_service = jpg_service
+        self.coadd_index = coadd_index
         self.ncols, self.n_per_page, self.figsize_per = ncols, n_per_page, figsize_per
         self.title_fontsize = title_fontsize or max(6, int(figsize_per * 4))
         self.n_workers = n_workers
@@ -175,6 +197,7 @@ class CutoutVetter:
         self.radec = dict(zip(sg.tolist(), zip(pool["RA"].tolist(), pool["DEC"].tolist())))
         self.pool_pos = {s: i for i, s in enumerate(sg.tolist())}
         self.proposed = dict(zip(sg.tolist(), pool["Morphology"].tolist()))
+        self.n_agree = dict(zip(sg.tolist(), pool["n_agree"].tolist()))
         self.groups = {}
         for s, m in zip(sg.tolist(), pool["Morphology"].tolist()):
             self.groups.setdefault(m, []).append(s)
@@ -220,7 +243,8 @@ class CutoutVetter:
     # ---------------------------------------------------------------- controls
     def _build_controls(self, header):
         self.view_selector = widgets.ToggleButtons(
-            options=["Image", "Model", "Residual", "SSL"] if self.load_jpg_fn is not None else ["SSL"],
+            options=((["Image", "Model", "Residual", "SSL"] if self.load_jpg_fn is not None else ["SSL"])
+                     + (["Coadd"] if self.coadd_index is not None else [])),
             value=self.view_mode, description="View:")
         self.view_selector.observe(self._on_view_mode_change, names="value")
         self.filter_selector = widgets.ToggleButtons(options=["All", "Unmarked only"],
@@ -302,6 +326,15 @@ class CutoutVetter:
 
     def _on_view_mode_change(self, change):
         self.view_mode = change["new"]
+        if self.view_mode == "Coadd" and self.coadd_index is not None:
+            for f in self.coadd_index.refresh(verbose=False):         # pick up chunks generated since last look
+                with self._h5_lock:
+                    H = self._h5_handles.pop(f, None)
+                if H is not None:
+                    try:
+                        H.close()
+                    except Exception:
+                        pass
         self._render_page()
 
     # ---------------------------------------------------------------- pagination
@@ -351,7 +384,13 @@ class CutoutVetter:
             start = self.page * self.n_per_page + 1
             shown = f"{start}-{min(start + self.n_per_page - 1, total)} of {total}"
         unmarked = sum(1 for k in self.keys if k not in self.votes)
-        self.page_label.value = (f"&nbsp;&nbsp;Page {self.page + 1}/{self.n_pages}&nbsp;(showing {shown})"
+        tier = ""
+        if self.mode == MODE_AGREED:
+            ns = [self.n_agree[k] for k in self._page_keys()]
+            if ns:
+                lo, hi = int(min(ns)), int(max(ns))
+                tier = (f"&nbsp;|&nbsp;agreed by <b>{hi if lo == hi else f'{lo}-{hi}'}</b> other vetter(s)")
+        self.page_label.value = (f"&nbsp;&nbsp;Page {self.page + 1}/{self.n_pages}&nbsp;(showing {shown}){tier}"
                                  f"&nbsp;|&nbsp;<b>{unmarked} unmarked</b> in this group"
                                  f"&nbsp;|&nbsp;{len(self.dirty)} unsaved&nbsp;&nbsp;")
         self.prev_btn.disabled = (self.page == 0)
@@ -362,19 +401,25 @@ class CutoutVetter:
         d = self.pool.iloc[self.pool_pos[key]].to_dict()
         return d
 
+    def _read_h5_rgb(self, fname, idx):
+        with self._h5_lock:
+            H = self._h5_handles.get(fname)
+            if H is None:
+                H = h5py.File(fname, "r")
+                self._h5_handles[fname] = H
+            img = H["images"][idx]
+        return self.sdss_rgb_fn([img[0], img[1], img[2]], ["g", "r", "z"])
+
     def _fetch_image_raw(self, key, view_mode):
         if view_mode == "SSL":
             ckey = self.sgaid_to_cutout.get(key)
             if ckey is None:
                 return None
             fname, idx = self.cutout_index[ckey]
-            with self._h5_lock:
-                H = self._h5_handles.get(fname)
-                if H is None:
-                    H = h5py.File(fname, "r")
-                    self._h5_handles[fname] = H
-                img = H["images"][idx]
-            return self.sdss_rgb_fn([img[0], img[1], img[2]], ["g", "r", "z"])
+            return self._read_h5_rgb(fname, idx)
+        if view_mode == "Coadd":
+            loc = self.coadd_index.lookup(key) if self.coadd_index is not None else None
+            return None if loc is None else self._read_h5_rgb(*loc)
         row = self._row(key)
         if self.load_jpg_band_fn is not None:
             try:
@@ -388,7 +433,8 @@ class CutoutVetter:
         return {"Model": model, "Residual": residual, "Image": image}
 
     def _prefetch_page_images(self, page_keys):
-        to_fetch = [k for k in page_keys if (k, self.view_mode) not in self._image_cache]
+        # re-check anything that came back empty last time (e.g. a JPG the background service has since fetched)
+        to_fetch = [k for k in page_keys if self._image_cache.get((k, self.view_mode)) is None]
         if not to_fetch:
             return
         progress = widgets.IntProgress(value=0, min=0, max=len(to_fetch), bar_style="info",
@@ -566,8 +612,14 @@ class CutoutVetter:
         except Exception as e:                                  # keep votes in memory, tell the user
             self.status.value = f"<b>SAVE FAILED</b> ({type(e).__name__}: {e}). Your votes are still in memory -- try Save again."
             return
+        saved = sorted(self.dirty)
         self.dirty.clear()
-        self.status.value = f"Saved {n} vote(s). Master updated: {self.store.master_path}"
+        jpg_note = ""
+        if self.jpg_service is not None:                        # fetch Image/Model/Residual JPGs in the background
+            ra_dec = [(k, *self.radec[k]) for k in saved]
+            self.jpg_service.enqueue(ra_dec, size_pix=getattr(self.source, "jpg_pix", None))
+            jpg_note = f" | {self.jpg_service.status()}"
+        self.status.value = f"Saved {n} vote(s). Master updated: {self.store.master_path}{jpg_note}"
         self._update_page_label()
 
     def _on_exit_click(self, _):
