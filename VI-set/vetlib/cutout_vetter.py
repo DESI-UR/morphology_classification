@@ -180,7 +180,7 @@ class CutoutVetter:
         self.n_workers = n_workers
         self.on_exit = on_exit
         self.view_mode = "Image" if load_jpg_fn is not None else "SSL"
-        self.filter_mode = "All"
+        self.filter_mode = "Unmarked only"   # default: hide galaxies already voted on; switch to "All" to revisit them
 
         # SGAID -> (region, sgaid) key into the cutout index (SGAIDs are unique in v1.0)
         self.sgaid_to_cutout, n_dup = {}, 0

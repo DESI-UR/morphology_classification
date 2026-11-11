@@ -17,16 +17,15 @@ is therefore small and never has to be pre-built). "Unvetted" galaxies are defin
 per-size-bin ML catalogs, which hold the full galaxy list and the ML-proposed morphology.
 SGAID is assumed unique (true for the v1.0 SGA-2025 catalog).
 """
-import hashlib # For seeding galaxy order
-import re # Regular expression - normalizes usernames
-from contextlib import contextmanager # Locking mechanism
-from dataclasses import dataclass # Create class with data attributes
-from datetime import datetime, timezone # Record vetting timestamps
-from pathlib import Path # Create path objects
-from typing import Optional # Create datatype or None objects
-
-# Standard python libraries
+import hashlib
 import os
+import re
+from contextlib import contextmanager
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Optional
+
 import numpy as np
 import pandas as pd
 
@@ -38,10 +37,7 @@ VALID_LABELS = set(LABELS + [BAD])
 MODE_UNVETTED = "Unvetted galaxies (ML-proposed morphology)"
 MODE_AGREED = "Galaxies other vetters already agree on"
 
-# Necessary to identify a galaxy
 FIXED_COLS = ["SGAID", "RA", "DEC", "D26"]
-
-# For vote files
 VOTE_COLS = ["SGAID", "label", "proposed", "source", "size_bin", "notes", "timestamp"]
 
 
@@ -59,11 +55,13 @@ class SizeBinSource:
     jpg_pix: int = 152                    # Legacy Surveys JPG cutout size (pixels @ 0.262"/px) for this bin
     coadd_dir: Optional[str] = None       # folder of coadd-derived HDF5 chunks for this bin (enables the "Coadd" view)
 
-# Restricts username to alphanumerics, allowing [_ . -] within the username
+
 _NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_.-]*$")
 
-# Normalize to lowercase and safeguard against broken filenames or existing columns
+
 def safe_username(raw):
+    """Normalise to lowercase (so 'QShimp' and 'qshimp' are one column) and reject anything that
+    could break a file name or collide with the master's fixed columns."""
     name = (raw or "").strip().lower()
     if not name:
         raise ValueError("Please enter a username.")
@@ -73,39 +71,36 @@ def safe_username(raw):
         raise ValueError(f"'{name}' is reserved -- please pick another username.")
     return name
 
-# Protect against corruption if multiple users save at once
-def _atomic_csv(df, path):
-    tmp = f"{path}.tmp.{os.getpid()}" # Create temporary file
-    df.to_csv(tmp, index=False)
-    os.replace(tmp, path) # vetters see the old file or the new one, never half of one
 
-# The store of vetting data
+def _atomic_csv(df, path):
+    tmp = f"{path}.tmp.{os.getpid()}"
+    df.to_csv(tmp, index=False)
+    os.replace(tmp, path)                  # readers see the old file or the new one, never half of one
+
+
 class VettingStore:
     def __init__(self, master_dir, catalog, catalog_cols=None, ml_id_col="SGAID",
                  ml_morph_col="Galaxy_Type", ml_proba_col="Top1_Proba"):
         """catalog : DataFrame or CSV path of the SGA-2025 catalog (supplies RA, DEC, D26).
         catalog_cols : override column names, e.g. {"D26": "D26_ARCMIN"}.
         """
-        # Define paths and column names
         self.master_dir = Path(master_dir)
         self.vetters_dir = self.master_dir / "vetters"
         self.vetters_dir.mkdir(parents=True, exist_ok=True)
         self.master_path = self.master_dir / "vetting_master.csv"
         self.ml_id_col, self.ml_morph_col = ml_id_col, ml_morph_col
         self.ml_proba_col = ml_proba_col
-        
+
         cols = dict(zip(FIXED_COLS, FIXED_COLS))
-        cols.update(catalog_cols or {}) # Insert custom column names
-        if isinstance(catalog, (str, Path)): # read the 4 columns we need from path
+        cols.update(catalog_cols or {})
+        if isinstance(catalog, (str, Path)):                 # read only the 4 columns we need (much faster)
             cat = pd.read_csv(catalog, usecols=[c for c in cols.values()], low_memory=False)
-        else: # read in full catalog
+        else:
             cat = catalog
-        missing = [v for v in cols.values() if v not in cat.columns] # Flag missing columns
+        missing = [v for v in cols.values() if v not in cat.columns]
         if missing:
             raise KeyError(f"Catalog is missing {missing}. Columns available: {list(cat.columns)}. "
                            f"Pass catalog_cols={{'RA': ..., 'DEC': ..., 'D26': ...}} to map them.")
-        
-        # Standardize column names
         cat = cat[[cols[c] for c in FIXED_COLS]].copy()
         cat.columns = FIXED_COLS
         cat["SGAID"] = cat["SGAID"].astype("int64")
@@ -114,8 +109,8 @@ class VettingStore:
     # ---------------------------------------------------------------- locking
     @contextmanager
     def _lock(self, timeout=15.0, stale=60.0):
-        """Cross-process lock that works on NERSC CFS (flock() is unsupported).
- 
+        """Cross-process lock that works on NERSC CFS, where flock() is unsupported (errno 524).
+
         Uses an atomically-created lock FILE (open with O_CREAT|O_EXCL, which every shared
         filesystem supports). The file records host:pid and is deleted on release. A lock older
         than `stale` seconds (a crashed kernel) is broken. Votes live in per-vetter files and the
@@ -124,27 +119,27 @@ class VettingStore:
         import socket
         import time
         path = self.master_dir / ".vetting.lock"
-        token = f"{socket.gethostname()}:{os.getpid()}:{time.time():.0f}" # Determines which user is holding the lock
+        token = f"{socket.gethostname()}:{os.getpid()}:{time.time():.0f}"
         held = False
         t0, warned = time.time(), False
         while True:
             try:
-                fd = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY) # Create lock file but fail if it already exists
+                fd = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
                 with os.fdopen(fd, "w") as fh:
-                    fh.write(token) # Write token
+                    fh.write(token)
                 held = True
                 break
             except FileExistsError:
                 try:
-                    if time.time() - path.stat().st_mtime > stale: # breaks a crash state
+                    if time.time() - path.stat().st_mtime > stale:       # crashed holder -> break it
                         path.unlink()
                         continue
                 except OSError:
-                    continue # Prevents error by multiple users breaking the crash state at once
-            except OSError as e:
+                    continue                                              # vanished/raced: retry now
+            except OSError as e:                                          # unwritable dir etc.
                 print(f"WARNING: cannot create the vetting lock ({e}); saving without it.")
                 break
-            if time.time() - t0 > timeout: # Continue without lock (risks master file but not vetter files) 
+            if time.time() - t0 > timeout:
                 print(f"WARNING: could not get the vetting lock in {timeout:.0f}s "
                       f"(held by {self._lock_holder(path)}). Continuing without it.")
                 break
@@ -157,24 +152,23 @@ class VettingStore:
         finally:
             if held:
                 try:
-                    if path.read_text() == token: # only remove our own lock
+                    if path.read_text() == token:                         # only remove our own lock
                         path.unlink()
                 except OSError:
                     pass
 
-    # Identify user via token
     @staticmethod
-    def _lock_holder(path): 
+    def _lock_holder(path):
         try:
             return Path(path).read_text().strip() or "unknown"
         except OSError:
             return "unknown"
-            
+
     # ---------------------------------------------------------------- reading
-    def _vetter_path(self, vetter): # Get path to vetter file
+    def _vetter_path(self, vetter):
         return self.vetters_dir / f"{vetter}.csv"
 
-    def _read_vetter(self, vetter): # Read vetter file
+    def _read_vetter(self, vetter):
         p = self._vetter_path(vetter)
         if not p.exists():
             return pd.DataFrame({c: pd.Series(dtype="object") for c in VOTE_COLS}).astype({"SGAID": "int64"})
@@ -182,7 +176,7 @@ class VettingStore:
         d["SGAID"] = d["SGAID"].astype("int64")
         return d
 
-    def list_vetters(self): # Get up-to-date list of vetters
+    def list_vetters(self):
         return sorted(p.stem for p in self.vetters_dir.glob("*.csv"))
 
     def all_votes(self):
@@ -222,12 +216,11 @@ class VettingStore:
             self._write_master()
         return len(rows)
 
-    # Change to columns for each vetter
     def build_wide(self):
         votes = self.all_votes()
         if votes.empty:
             return pd.DataFrame(columns=FIXED_COLS)
-        wide = votes.pivot(index="SGAID", columns="vetter", values="label") 
+        wide = votes.pivot(index="SGAID", columns="vetter", values="label")
         wide = wide.reindex(columns=sorted(wide.columns))
         out = self.catalog.set_index("SGAID")[["RA", "DEC", "D26"]].reindex(wide.index).join(wide)
         n_missing = int(out["RA"].isna().sum())
@@ -235,13 +228,11 @@ class VettingStore:
             print(f"WARNING: {n_missing} vetted SGAID(s) are not in the catalog (RA/DEC/D26 left blank).")
         return out.reset_index()
 
-    # Write master file
     def _write_master(self):
         wide = self.build_wide()
         _atomic_csv(wide, self.master_path)
         return wide
 
-    # Write master file under lock
     def rebuild_master(self):
         with self._lock():
             return self._write_master()
@@ -260,43 +251,54 @@ class VettingStore:
             ml = pd.read_csv(source.ml_catalog, usecols=use)
         except ValueError as e:
             raise ValueError(f"{source.ml_catalog} must contain columns {use}: {e}")
-
-        # Get morphologies from classifier run
-        ml = ml.rename(columns={self.ml_id_col: "SGAID", self.ml_morph_col: "Morphology", self.ml_proba_col: "Top1_Proba"})
+        ml = ml.rename(columns={self.ml_id_col: "SGAID", self.ml_morph_col: "Morphology",
+                                self.ml_proba_col: "Top1_Proba"})
         ml["SGAID"] = ml["SGAID"].astype("int64")
         ml = ml.drop_duplicates("SGAID")
         morph = ml["Morphology"].astype(str).str.strip()
         n_odd = int((~morph.isin(LABELS)).sum())
         ml["Morphology"] = morph.where(morph.isin(LABELS), UNKNOWN)
 
-        # Establish previous votes
         votes = self.all_votes()
         mine = votes[votes["vetter"] == vetter]
 
         if mode == MODE_UNVETTED:
             tag = f"ml:{source.label}"
-            # Keep unvetted galaxies, as well as galaxies vetted by current vetter
-            keep = ~ml["SGAID"].isin(votes["SGAID"]) | ml["SGAID"].isin(mine.loc[mine["source"] == tag, "SGAID"])
+            # unvetted galaxies, plus everything THIS vetter has voted on (any source/mode), so their
+            # earlier work stays visible under "All"; the vetter's default "Unmarked only" view hides it
+            keep = ~ml["SGAID"].isin(votes["SGAID"]) | ml["SGAID"].isin(mine["SGAID"])
             pool = ml[keep].copy()
         elif mode == MODE_AGREED:
             tag = f"consensus:{source.label}"
             others = votes[votes["vetter"] != vetter]
             g = others.groupby("SGAID")["label"].agg(n="size", u="nunique", label="first")
-            agreed = g[g["u"] == 1] # every other vote is the same label
-            mine_any = set(mine["SGAID"]) # Get all galaxies vetted by current user
-            mine_here = set(mine.loc[mine["source"] == tag, "SGAID"]) 
-            ok = agreed.index[agreed.index.isin(mine_here) | ~agreed.index.isin(mine_any)]
-            pool = ml[ml["SGAID"].isin(ok)].copy()
-            pool["Morphology"] = agreed["label"].reindex(pool["SGAID"]).to_numpy()
-            pool["n_agree"] = agreed["n"].reindex(pool["SGAID"]).to_numpy()
+            agreed = g[g["u"] == 1]            # every other vote is the same label (1 vote qualifies)
+            # every galaxy the others agree on stays in the pool, including ones this vetter already
+            # voted on (any source): they show as marked under "All" and are hidden by "Unmarked only"
+            ok = agreed.index
+            # the pool comes from the master catalog (anchors need not be in the ML catalog), restricted
+            # to THIS size bin by D26 so a bin never shows galaxies from another bin
+            pool = self.catalog[self.catalog["SGAID"].isin(ok)].copy()
+            want = self.bin_index_of_label(source.label)
+            if want is None:
+                print(f"WARNING: can't read a size range from the bin label {source.label!r}; not filtering by size.")
+                in_bin = pd.Series(True, index=pool.index)
+            else:
+                in_bin = pool["SGAID"].map(self.size_bin_index()) == want
+            n_other = int((~in_bin).sum())
+            pool = pool[in_bin].copy()
+            sub = agreed.loc[pool["SGAID"]]
+            pool["Morphology"] = sub["label"].to_numpy()
+            pool["n_agree"] = sub["n"].to_numpy()
+            pool.attrs["n_agreed_other_bins"] = n_other
         else:
             raise ValueError(f"Unknown mode {mode!r}")
 
         pool["source"] = tag
         if "n_agree" not in pool:
             pool["n_agree"] = 0
-        pool = pool.merge(self.catalog, on="SGAID", how="left")
-        if mode == MODE_UNVETTED:
+        if mode == MODE_UNVETTED:                                # ML rows carry no RA/DEC/D26 yet
+            pool = pool.merge(self.catalog, on="SGAID", how="left")
             # highest ML confidence first; ties and NaNs broken by SGAID so the order is stable
             pool = pool.sort_values(["Top1_Proba", "SGAID"], ascending=[False, True],
                                     na_position="last").reset_index(drop=True)
@@ -339,12 +341,11 @@ class VettingStore:
             self._write_master()
         print(f"Done. {target!r} now has {len(merged)} votes; {source!r} archived to {arch}.")
 
-
     def backfill_declared(self, vetter, from_vetters=None, sources=("legacy",), dry_run=True):
         """Give `vetter` a vote on every galaxy they never voted on, using the morphology that was DECLARED
         when other vetters reviewed it (their `proposed` field -- in imported legacy votes this is the
         anchor-catalog label the galaxy was shown under, i.e. what the owner of the set had assigned).
- 
+
         Guards: only votes whose source is in `sources` count (default "legacy": for votes made in the new
         tool, `proposed` is an ML or consensus label, NOT the owner's judgement); the declared label must be
         one of the four morphologies; galaxies where the other vetters saw DIFFERENT declared labels are
@@ -376,7 +377,35 @@ class VettingStore:
         self.save_votes(vetter, rows)
         print(f"Added {len(rows):,d} votes for {vetter!r}. Run store.import_size_bins(dry_run=False) to fill their bins.")
         return new.reset_index()
-    
+
+    @staticmethod
+    def _bin_label(k, bin_width=39.824):
+        """Classifier-style label for bin k: 0-39arcsec, 40-79arcsec, 80-119arcsec, ..."""
+        lo = 0 if k == 0 else int(np.floor(k * bin_width)) + 1
+        return f"{lo}-{int(np.floor((k + 1) * bin_width))}arcsec"
+
+    @staticmethod
+    def bin_index_of_label(label, bin_width=39.824):
+        """Bin number a label like '40-79arcsec' refers to (also accepts the older '39-79arcsec' spelling);
+        None if the label can't be parsed."""
+        m = re.match(r"^\s*(\d+)\s*-\s*(\d+)", str(label))
+        if not m:
+            return None
+        lo = int(m.group(1))
+        return 0 if lo == 0 else int(round((lo - 1) / bin_width))
+
+    def size_bin_index(self, bin_width=39.824, d26_units="arcmin"):
+        """Series SGAID -> integer size-bin number from D26 (NaN where D26 is missing)."""
+        to_arcsec = {"arcsec": 1.0, "arcmin": 60.0, "deg": 3600.0}[d26_units]
+        d26 = self.catalog.set_index("SGAID")["D26"].astype(float) * to_arcsec
+        return np.ceil(d26 / bin_width - 1e-12).clip(lower=1) - 1
+
+    def size_bin_of(self, bin_width=39.824, d26_units="arcmin"):
+        """Series SGAID -> size-bin label from D26, in the classifier's spelling. The one definition used
+        by import_size_bins and by the agreed-mode pool."""
+        idx = self.size_bin_index(bin_width, d26_units)
+        return idx.map(lambda k: None if k != k else self._bin_label(int(k), bin_width))
+
     def import_size_bins(self, bin_width=39.824, d26_units="arcmin", overwrite=False, dry_run=True):
         """Backfill the size_bin column of every vote from the catalog's D26.
 
@@ -385,13 +414,8 @@ class VettingStore:
         filled (legacy imports and anything saved before bins were tracked) unless overwrite=True. Votes
         whose existing size_bin disagrees with D26 are counted and reported either way. The vote's `source`
         tag is never touched, so resuming sessions keeps working. Run with dry_run=True first."""
-        to_arcsec = {"arcsec": 1.0, "arcmin": 60.0, "deg": 3600.0}[d26_units]
-        d26 = self.catalog.set_index("SGAID")["D26"] * to_arcsec
-        top = np.ceil(np.nanmax(d26.to_numpy()) / bin_width) * bin_width
-        edges = np.arange(0.0, top + bin_width, bin_width)
-        labels = [f"{int(edges[i])}-{int(edges[i + 1])}arcsec" for i in range(len(edges) - 1)]
-        bin_of = pd.Series(pd.cut(d26.to_numpy(), bins=edges, include_lowest=True, labels=labels).astype(object),
-                           index=d26.index)
+        bin_of = self.size_bin_of(bin_width, d26_units)
+        labels = sorted(bin_of.dropna().unique(), key=lambda x: int(x.split("-")[0]))
         report = []
         with self._lock():
             for v in self.list_vetters():
